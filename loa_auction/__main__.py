@@ -131,6 +131,8 @@ def run_app() -> int:
     config_path = default_config_path()
     config, warning = load_config_checked(config_path)
     window = MiniWindow(config, config_path, HistoryStore())
+    # 아이콘으로 접힌 상태(창이 숨겨진 상태)에서 '종료'해도 앱이 확실히 끝나도록 연결한다.
+    window.exitRequested.connect(app.quit)
     if warning:
         window.set_status(warning)
     window.show()

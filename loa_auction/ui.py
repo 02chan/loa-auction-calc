@@ -16,24 +16,29 @@ from pathlib import Path
 from typing import Callable
 
 from PIL import Image
-from PySide6.QtCore import QMetaObject, QObject, QPoint, QRunnable, Qt, QThreadPool, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, QPoint, QRectF, QRunnable, Qt, QThreadPool, Signal, Slot
 from PySide6.QtGui import (
+    QColor,
     QFont,
     QGuiApplication,
     QIcon,
     QKeyEvent,
     QKeySequence,
+    QPainter,
+    QPen,
     QPixmap,
     QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStyledItemDelegate,
@@ -53,12 +58,14 @@ from .icon import render_icon
 from .ocr import OcrResult, OcrUnavailableError
 
 GOLD = "#F5C242"  # 골드 아이콘 색
+WINDOW_BG = "#1d1f26"
+WINDOW_BORDER = "#454a58"
+WINDOW_RADIUS = 8
 RECENT_COUNT = 10
 FAIL_TEXT = "인식 실패"
 NO_IMAGE_TEXT = "클립보드에 이미지가 없습니다. Win+Shift+S로 경매 창을 캡처한 뒤 Ctrl+V 하세요."
 
 STYLE = f"""
-QWidget#MiniWindow {{ background: #1d1f26; }}
 QWidget {{ color: #e6e6e6; font-family: 'Malgun Gothic'; font-size: 9pt; }}
 QLineEdit {{ background: #2a2d36; border: 1px solid #3c404c; border-radius: 4px; padding: 3px 6px; font-size: 11pt; }}
 QLineEdit:focus {{ border-color: {GOLD}; }}
@@ -71,6 +78,14 @@ QLabel#Small:hover {{ color: #ffffff; text-decoration: underline; }}
 QLabel#Bid:hover {{ color: #ffd86b; }}
 QLabel#Status {{ color: #9aa0ad; font-size: 8pt; }}
 QToolButton {{ border: none; color: #a8acb8; }}
+QToolButton#CollapseButton, QToolButton#CloseButton {{
+    border: none; border-radius: 4px; background: transparent; color: #c9ccd6; font-size: 10pt; }}
+QToolButton#CollapseButton:hover {{ background: #343844; color: #ffffff; }}
+QToolButton#CloseButton:hover {{ background: #c42b1c; color: #ffffff; }}
+QMenu {{ background: #23262e; border: 1px solid {WINDOW_BORDER}; padding: 4px; }}
+QMenu::item {{ color: #e6e6e6; padding: 5px 22px 5px 14px; border-radius: 3px; }}
+QMenu::item:selected {{ background: #343844; color: #ffffff; }}
+QMenu::separator {{ height: 1px; background: #3c404c; margin: 3px 6px; }}
 QTableWidget {{ background: #23262e; gridline-color: #333743; font-size: 8pt; }}
 QHeaderView::section {{ background: #2a2d36; color: #a8acb8; border: none; padding: 2px; font-size: 8pt; }}
 QCheckBox {{ color: #a8acb8; font-size: 8pt; }}
@@ -164,6 +179,120 @@ class CopyLabel(QLabel):
         super().mouseReleaseEvent(event)
 
 
+class DragArea(QWidget):
+    """누르고 끌면 창 전체가 움직이는 영역(윈도우 제목 표시줄 대신)."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._offset: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None and handle.startSystemMove():
+                event.accept()  # Windows가 직접 옮긴다(화면 가장자리 맞춤 등 동작 유지)
+                return
+            self._offset = event.globalPosition().toPoint() - self.window().pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._offset = None
+        super().mouseReleaseEvent(event)
+
+
+class IconBubble(QWidget):
+    """창을 접었을 때 화면에 떠 있는 작은 프로그램 아이콘.
+
+    클릭: 원래 창으로 펼치기 / 끌기: 옮기기 / 오른쪽 클릭: 펼치기·종료 메뉴
+    작업 표시줄에는 나오지 않는 도구 창이다.
+    """
+
+    SIZE = 48
+    clicked = Signal()
+    exitRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("클릭: 펼치기 · 끌기: 옮기기 · 오른쪽 클릭: 메뉴")
+        self.setWindowTitle("로아 경매 계산기")
+        pixmap = QPixmap.fromImage(capture.pil_to_qimage(render_icon(self.SIZE * 2)))
+        pixmap.setDevicePixelRatio(2.0)  # 고해상도 화면에서도 선명하게
+        self._pixmap = pixmap
+        self._press: QPoint | None = None
+        self._dragging = False
+        self._offset: QPoint | None = None
+        self.hovered = False
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawPixmap(self.rect(), self._pixmap)
+        if self.hovered:  # 마우스를 올리면 골드 테두리
+            p.setPen(QPen(QColor(GOLD), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            radius = self.SIZE * 0.2
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5), radius, radius)
+        p.end()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press = event.globalPosition().toPoint()
+            self._dragging = False
+            self._offset = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._press is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            point = event.globalPosition().toPoint()
+            if not self._dragging and (point - self._press).manhattanLength() >= QApplication.startDragDistance():
+                self._dragging = True  # 일정 거리 이상 움직이면 클릭이 아니라 끌기
+                handle = self.windowHandle()
+                if handle is None or not handle.startSystemMove():
+                    self._offset = self._press - self.pos()
+            if self._offset is not None:
+                self.move(point - self._offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._press is not None and not self._dragging:
+            self.clicked.emit()
+        self._press, self._dragging, self._offset = None, False, None
+        super().mouseReleaseEvent(event)
+
+    def build_menu(self) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("펼치기", self.clicked.emit)
+        menu.addSeparator()
+        menu.addAction("종료", self.exitRequested.emit)
+        return menu
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        self.build_menu().exec(event.globalPos())
+
+
 class _ActualPriceDelegate(QStyledItemDelegate):
     """실제낙찰가 편집기. 편집을 시작한 기록 행 번호를 기억해, 편집 중 표가 다시 그려져도
     엉뚱한 행에 저장되지 않게 한다."""
@@ -202,6 +331,8 @@ def _clipboard_digits() -> str | None:
 class MiniWindow(QWidget):
     COL_TIME, COL_ITEM, COL_PRICE, COL_PARTY, COL_BID, COL_ACTUAL = range(6)
 
+    exitRequested = Signal()  # ✕ 또는 아이콘 메뉴의 '종료' (앱 종료 요청)
+
     def __init__(
         self,
         config: Config,
@@ -222,14 +353,21 @@ class MiniWindow(QWidget):
         self._history_dirty = False
         self.result: CalcResult | None = None  # 현재 표시 중인 계산 결과
         self._price_edited = False
+        self._collapsed = False
 
         self.setObjectName("MiniWindow")
         self.setWindowTitle("로아 경매 계산기")
         self.setWindowIcon(app_icon())
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 윈도우 제목 표시줄 없이 항상 위. 배경(둥근 사각형)은 paintEvent에서 직접 그린다.
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(STYLE)
         self._build_ui()
+        self.bubble = IconBubble(self)
+        self.bubble.clicked.connect(self.expand)
+        self.bubble.exitRequested.connect(self.exit_app)
         self.resize(320, 240)
         self._restore_position()
 
@@ -245,10 +383,38 @@ class MiniWindow(QWidget):
         root.setContentsMargins(10, 8, 10, 6)
         root.setSpacing(5)
 
+        # 맨 윗줄: [아이콘] 아이템명 ........ [—] [✕]  (이 줄을 끌어서 창을 옮긴다)
+        self.header = DragArea()
+        self.header.setToolTip("끌어서 창 옮기기")
+        header_row = QHBoxLayout(self.header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
+        icon_label = QLabel()
+        icon_label.setPixmap(app_icon().pixmap(16, 16))
+        icon_label.setFixedSize(16, 16)
         self.item_label = QLabel("경매 화면을 캡처하세요")
         self.item_label.setObjectName("ItemName")
-        self.item_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        root.addWidget(self.item_label)
+        # 글자 선택을 끄면 이 줄 어디를 눌러도 창 끌기로 동작한다
+        self.item_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.collapse_button = QToolButton()
+        self.collapse_button.setObjectName("CollapseButton")
+        self.collapse_button.setText("—")
+        self.collapse_button.setToolTip("아이콘으로 접기")
+        self.collapse_button.setFixedSize(24, 22)
+        self.collapse_button.clicked.connect(self.collapse)
+        self.close_button = QToolButton()
+        self.close_button.setObjectName("CloseButton")
+        self.close_button.setText("✕")
+        self.close_button.setToolTip("종료")
+        self.close_button.setFixedSize(24, 22)
+        self.close_button.clicked.connect(self.exit_app)
+        for button in (self.collapse_button, self.close_button):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        header_row.addWidget(icon_label)
+        header_row.addWidget(self.item_label, 1)
+        header_row.addWidget(self.collapse_button)
+        header_row.addWidget(self.close_button)
+        root.addWidget(self.header)
 
         row = QHBoxLayout()
         caption = QLabel("거래소 가격")
@@ -517,6 +683,7 @@ class MiniWindow(QWidget):
     @Slot(object)
     def _on_ocr_finished(self, result: OcrResult) -> None:
         self._busy = False
+        self.expand()  # 아이콘으로 접혀 있었다면 결과를 볼 수 있게 펼친다
         if not result.success or result.price is None:
             self.show_failure("가격을 찾지 못했습니다. 경매 창의 '거래소 최저가'가 보이게 캡처하세요.")
             return
@@ -542,12 +709,14 @@ class MiniWindow(QWidget):
     @Slot(str)
     def _on_ocr_unavailable(self, message: str) -> None:
         self._busy = False
+        self.expand()
         self.show_failure("한국어 OCR을 사용할 수 없습니다.")
         self.show_ocr_unavailable(message)
 
     @Slot(str)
     def _on_ocr_error(self, message: str) -> None:
         self._busy = False
+        self.expand()
         self.show_failure(f"OCR 오류: {message}")
 
     def show_failure(self, detail: str) -> None:
@@ -661,8 +830,66 @@ class MiniWindow(QWidget):
         if QGuiApplication.screenAt(point + QPoint(20, 20)) is not None:
             self.move(point)
 
+    # ------------------------------------------------------------ 창 모양: 테두리 없는 창 / 아이콘 접기
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """제목 표시줄 없는 반투명 창이라 배경(둥근 사각형 + 1px 테두리)을 직접 그린다."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(WINDOW_BORDER), 1))
+        p.setBrush(QColor(WINDOW_BG))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), WINDOW_RADIUS, WINDOW_RADIUS)
+        p.end()
+
+    @property
+    def collapsed(self) -> bool:
+        return self._collapsed
+
+    @Slot()
+    def collapse(self) -> None:
+        """창을 숨기고 그 자리(왼쪽 위)에 작은 아이콘을 띄운다. 단축키는 계속 동작한다."""
+        if self._collapsed:
+            return
+        self._collapsed = True
+        self.bubble.move(self.pos())
+        self.bubble.show()
+        self.bubble.raise_()
+        self.hide()
+
+    @Slot()
+    def expand(self) -> None:
+        """아이콘 자리에서 원래 창을 다시 펼친다(화면 밖으로 나가지 않게 맞춘다)."""
+        if not self._collapsed:
+            return
+        self._collapsed = False
+        self.move(self._fit_on_screen(self.bubble.pos()))
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.bubble.hide()
+
+    def _fit_on_screen(self, point: QPoint) -> QPoint:
+        screen = (
+            QGuiApplication.screenAt(point + QPoint(IconBubble.SIZE // 2, IconBubble.SIZE // 2))
+            or self.screen()
+            or QGuiApplication.primaryScreen()
+        )
+        if screen is None:
+            return point
+        area = screen.availableGeometry()
+        x = max(area.left(), min(point.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(point.y(), area.bottom() - self.height() + 1))
+        return QPoint(x, y)
+
+    @Slot()
+    def exit_app(self) -> None:
+        """✕ 버튼 / 아이콘 메뉴 '종료': 설정을 저장하고 단축키를 해제한 뒤 앱 종료를 요청한다."""
+        self.close()
+        self.exitRequested.emit()
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.config.window_pos = [self.x(), self.y()]
+        pos = self.bubble.pos() if self._collapsed else self.pos()
+        self.config.window_pos = [pos.x(), pos.y()]
+        self.bubble.hide()
         self.save_config()
         self._teardown_hotkey()
         super().closeEvent(event)
