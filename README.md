@@ -110,6 +110,7 @@ P = 거래소 최저가, N = 인원(4 또는 8)
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 - `.venv` 생성 → 의존성 설치 → PyInstaller(onefile, windowed) → `dist\LoaAuctionCalc.exe`
+- 프로그램 아이콘(어두운 바탕의 골드 코인 + 경매 망치)은 `loa_auction/icon.py`가 코드로 그립니다. 빌드할 때 `build\icon\LoaAuctionCalc.ico`(16~256px)를 만들어 exe에 넣고, 실행 중에는 같은 그림을 창·작업 표시줄 아이콘으로 씁니다. 저장소에는 이미지 파일을 두지 않습니다. 아이콘 파일만 따로 만들려면 `.\.venv\Scripts\python -m loa_auction.icon 경로.ico`
 - `fixtures\sample_<이름>_<가격>.png` 이미지가 있으면 exe에 넣고, 빌드 마지막에 `--selftest`로 OCR까지 검사합니다. 이미지가 없어도 빌드는 성공합니다(이때 자체 검사는 계산만 확인하고 "OCR 샘플 없음"을 출력).
 - 자체 검사만 따로 실행하기: 창 프로그램(--windowed)이라 PowerShell이 끝날 때까지 기다리지 않으므로 아래처럼 실행합니다. `0`이 나오면 통과이고, 자세한 결과는 `dist\selftest.log`에 저장됩니다.
   ```powershell

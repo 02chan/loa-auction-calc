@@ -11,12 +11,21 @@
 from __future__ import annotations
 
 import csv
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 from PIL import Image
 from PySide6.QtCore import QMetaObject, QObject, QPoint, QRunnable, Qt, QThreadPool, Signal, Slot
-from PySide6.QtGui import QFont, QGuiApplication, QKeyEvent, QKeySequence, QRegularExpressionValidator
+from PySide6.QtGui import (
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QKeyEvent,
+    QKeySequence,
+    QPixmap,
+    QRegularExpressionValidator,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -40,6 +49,7 @@ from . import hotkey as hotkey_mod
 from .calc import CalcResult, calculate
 from .config import Config, save_config
 from .history import HistoryStore
+from .icon import render_icon
 from .ocr import OcrResult, OcrUnavailableError
 
 GOLD = "#F5C242"  # 골드 아이콘 색
@@ -69,6 +79,18 @@ QCheckBox {{ color: #a8acb8; font-size: 8pt; }}
 
 def _fmt(value: int) -> str:
     return f"{value:,}"
+
+
+WINDOW_ICON_SIZES = (16, 24, 32, 48, 64)
+
+
+@lru_cache(maxsize=1)
+def app_icon() -> QIcon:
+    """제목 표시줄·작업 표시줄용 아이콘(코드로 그린 골드 코인 + 경매 망치)."""
+    icon = QIcon()
+    for n in WINDOW_ICON_SIZES:
+        icon.addPixmap(QPixmap.fromImage(capture.pil_to_qimage(render_icon(n))))
+    return icon
 
 
 class _OcrSignals(QObject):
@@ -203,6 +225,7 @@ class MiniWindow(QWidget):
 
         self.setObjectName("MiniWindow")
         self.setWindowTitle("로아 경매 계산기")
+        self.setWindowIcon(app_icon())
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(STYLE)

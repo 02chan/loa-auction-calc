@@ -86,11 +86,16 @@ if ($AddData.Count -eq 0) {
     Write-Host '  fixtures 이미지 없음: OCR 샘플 없이 빌드합니다 (--selftest는 계산만 검사).'
 }
 
+# exe 아이콘: 저장소에 이미지 파일을 두지 않고 코드(loa_auction\icon.py)로 그려 만든다.
+$IconPath = Join-Path $Root 'build\icon\LoaAuctionCalc.ico'
+Invoke-Native $VenvPython -m loa_auction.icon $IconPath
+
 $PyInstallerArgs = @(
     '-m', 'PyInstaller',
     '--noconfirm', '--clean',
     '--onefile', '--windowed',
     '--name', 'LoaAuctionCalc',
+    '--icon', $IconPath,
     '--distpath', (Join-Path $Root 'dist'),
     '--workpath', (Join-Path $Root 'build'),
     '--specpath', (Join-Path $Root 'build'),

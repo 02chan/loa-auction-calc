@@ -123,10 +123,11 @@ def run_app() -> int:
     from loa_auction import ocr
     from loa_auction.config import default_config_path, load_config_checked
     from loa_auction.history import HistoryStore
-    from loa_auction.ui import MiniWindow
+    from loa_auction.ui import MiniWindow, app_icon
 
     app = QApplication(sys.argv)
     app.setApplicationName("LoaAuctionCalc")
+    app.setWindowIcon(app_icon())  # 안내 창(QMessageBox) 등에도 같은 아이콘
     config_path = default_config_path()
     config, warning = load_config_checked(config_path)
     window = MiniWindow(config, config_path, HistoryStore())
