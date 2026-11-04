@@ -122,7 +122,7 @@ def test_dragging_icon_moves_it_without_expanding(qtbot, make_window):
     assert bubble.pos() == QPoint(240, 150)
     qtbot.mouseClick(bubble, Qt.MouseButton.LeftButton)
     assert not win.collapsed
-    assert win.pos() == win._fit_on_screen(QPoint(240, 150))
+    assert win.pos() == win._fit_on_screen(QPoint(240, 150), win.width(), win.height())
 
 
 def test_expand_keeps_window_on_screen(make_window):
@@ -150,6 +150,79 @@ def test_icon_menu_has_expand_and_exit(qtbot, make_window):
         win.bubble.build_menu().actions()[-1].trigger()  # 종료
     assert not win.bubble.isVisible() and not win.isVisible()
     assert load_config(make_window.config_path).window_pos == [210, 130]  # 아이콘 위치 저장
+
+
+def _corner(win) -> QPoint:
+    area = win.screen().availableGeometry()
+    return QPoint(area.right() - IconBubble.SIZE + 1, area.bottom() - IconBubble.SIZE + 1)
+
+
+def test_icon_returns_to_user_placed_corner_after_expand(make_window):
+    """아이콘을 화면 구석에 두고 펼쳤다가 다시 접으면, 창 왼쪽 위가 아니라 그 구석으로 돌아간다."""
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    corner = _corner(win)
+    win.bubble.move(corner)  # 사용자가 아이콘을 구석으로 끌어다 놓음
+    win.expand()
+    assert win.pos() != corner  # 창은 화면 안에 들어오도록 왼쪽 위로 밀려서 열림
+    win.collapse()
+    assert win.bubble.pos() == corner
+    # 여러 번 반복해도 같은 자리
+    win.expand()
+    win.move(300, 200)  # 펼친 창을 다른 곳으로 옮겨도
+    win.collapse()
+    assert win.bubble.pos() == corner
+
+
+def test_icon_follows_window_until_user_moves_it(make_window):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    win.expand()
+    win.move(400, 300)
+    win.collapse()
+    assert win.bubble.pos() == QPoint(400, 300)  # 아이콘을 옮긴 적이 없으면 창 왼쪽 위
+    assert win.config.icon_pos is None
+
+
+def test_icon_position_is_saved_and_restored_after_restart(qtbot, make_window, tmp_path):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    win.bubble.move(QPoint(330, 210))  # 사용자가 옮김
+    win.exit_app()  # 접힌 채로 종료
+    saved = load_config(make_window.config_path)
+    assert saved.icon_pos == [330, 210]
+    assert saved.window_pos == [200, 120]  # 창 위치는 따로 저장
+    again = MiniWindow(saved, make_window.config_path, HistoryStore(tmp_path / "history.csv"))
+    qtbot.addWidget(again)
+    qtbot.addWidget(again.bubble)
+    again.show()
+    assert again.pos() == QPoint(200, 120)
+    again.collapse()
+    assert again.bubble.pos() == QPoint(330, 210)
+
+
+def test_offscreen_saved_icon_position_falls_back_to_window(make_window):
+    win = make_window(Config(capture_enabled=False, icon_pos=[-50000, -50000]))  # 없어진 모니터
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    assert win.bubble.pos() == QPoint(200, 120)
+
+
+def test_program_placement_is_not_remembered_as_user_move(make_window):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()  # 프로그램이 아이콘을 놓음(place)
+    win.bubble.hide()
+    win.bubble.show()  # 다시 표시될 때 생기는 이동 이벤트
+    assert win.config.icon_pos is None
 
 
 def test_icon_menu_is_dark_and_readable(make_window):

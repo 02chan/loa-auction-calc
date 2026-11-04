@@ -215,12 +215,15 @@ class IconBubble(QWidget):
     SIZE = 48
     clicked = Signal()
     exitRequested = Signal()
+    movedByUser = Signal(QPoint)  # 사용자가 끌어서 옮긴 새 위치(프로그램이 place()로 놓은 것은 제외)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(
             parent,
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint,
         )
+        self._placing = False
+        self._placed_at: QPoint | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setFixedSize(self.SIZE, self.SIZE)
@@ -281,6 +284,22 @@ class IconBubble(QWidget):
             self.clicked.emit()
         self._press, self._dragging, self._offset = None, False, None
         super().mouseReleaseEvent(event)
+
+    def place(self, point: QPoint) -> None:
+        """프로그램이 아이콘을 놓는다(사용자가 옮긴 위치로 기억하지 않는다)."""
+        self._placed_at = QPoint(point)
+        self._placing = True
+        try:
+            self.move(point)
+        finally:
+            self._placing = False
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        # Windows 시스템 끌기(startSystemMove) 중에는 마우스 이벤트가 오지 않으므로 이동 이벤트로 알아낸다.
+        # place()로 놓은 자리에서 생기는 이동 이벤트(표시될 때의 늦은 이벤트 포함)는 사용자 이동이 아니다.
+        if not self._placing and self.pos() != self._placed_at:
+            self.movedByUser.emit(self.pos())
+        super().moveEvent(event)
 
     def build_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -368,6 +387,7 @@ class MiniWindow(QWidget):
         self.bubble = IconBubble(self)
         self.bubble.clicked.connect(self.expand)
         self.bubble.exitRequested.connect(self.exit_app)
+        self.bubble.movedByUser.connect(self._on_icon_moved_by_user)
         self.resize(320, 240)
         self._restore_position()
 
@@ -846,11 +866,16 @@ class MiniWindow(QWidget):
 
     @Slot()
     def collapse(self) -> None:
-        """창을 숨기고 그 자리(왼쪽 위)에 작은 아이콘을 띄운다. 단축키는 계속 동작한다."""
+        """창을 숨기고 작은 아이콘을 띄운다. 단축키는 계속 동작한다.
+
+        아이콘 위치: 사용자가 아이콘을 끌어다 놓은 적이 있으면 그 자리(재시작 후에도 유지),
+        없으면 창의 왼쪽 위.
+        """
         if self._collapsed:
             return
         self._collapsed = True
-        self.bubble.move(self.pos())
+        target = self._remembered_icon_pos() or self.pos()
+        self.bubble.place(self._fit_on_screen(target, IconBubble.SIZE, IconBubble.SIZE))
         self.bubble.show()
         self.bubble.raise_()
         self.hide()
@@ -861,13 +886,29 @@ class MiniWindow(QWidget):
         if not self._collapsed:
             return
         self._collapsed = False
-        self.move(self._fit_on_screen(self.bubble.pos()))
+        self.move(self._fit_on_screen(self.bubble.pos(), self.width(), self.height()))
         self.show()
         self.raise_()
         self.activateWindow()
         self.bubble.hide()
+        self.save_config()  # 끌어다 놓은 아이콘 위치를 바로 저장
 
-    def _fit_on_screen(self, point: QPoint) -> QPoint:
+    @Slot(QPoint)
+    def _on_icon_moved_by_user(self, pos: QPoint) -> None:
+        if self._collapsed:
+            self.config.icon_pos = [pos.x(), pos.y()]
+
+    def _remembered_icon_pos(self) -> QPoint | None:
+        """기억한 아이콘 위치. 모니터 구성이 바뀌어 화면 밖이면 None."""
+        pos = self.config.icon_pos
+        if not pos:
+            return None
+        point = QPoint(pos[0], pos[1])
+        center = point + QPoint(IconBubble.SIZE // 2, IconBubble.SIZE // 2)
+        return point if QGuiApplication.screenAt(center) is not None else None
+
+    def _fit_on_screen(self, point: QPoint, width: int, height: int) -> QPoint:
+        """width×height 크기 창의 왼쪽 위를 point 근처, 화면 안에 들어오는 자리로 맞춘다."""
         screen = (
             QGuiApplication.screenAt(point + QPoint(IconBubble.SIZE // 2, IconBubble.SIZE // 2))
             or self.screen()
@@ -876,8 +917,8 @@ class MiniWindow(QWidget):
         if screen is None:
             return point
         area = screen.availableGeometry()
-        x = max(area.left(), min(point.x(), area.right() - self.width() + 1))
-        y = max(area.top(), min(point.y(), area.bottom() - self.height() + 1))
+        x = max(area.left(), min(point.x(), area.right() - width + 1))
+        y = max(area.top(), min(point.y(), area.bottom() - height + 1))
         return QPoint(x, y)
 
     @Slot()
@@ -887,8 +928,8 @@ class MiniWindow(QWidget):
         self.exitRequested.emit()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        pos = self.bubble.pos() if self._collapsed else self.pos()
-        self.config.window_pos = [pos.x(), pos.y()]
+        # 창 위치와 아이콘 위치는 따로 저장한다(접힌 채로 종료해도 창은 마지막 창 자리에서 다시 열림).
+        self.config.window_pos = [self.x(), self.y()]
         self.bubble.hide()
         self.save_config()
         self._teardown_hotkey()

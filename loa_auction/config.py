@@ -30,12 +30,25 @@ def default_config_path() -> Path:
     return app_dir() / CONFIG_FILENAME
 
 
+def _point_or_none(value: object) -> list[int] | None:
+    """[x, y] 정수 두 개면 그대로, 아니면 None."""
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+    ):
+        return [value[0], value[1]]
+    return None
+
+
 @dataclass
 class Config:
     hotkey: str = DEFAULT_HOTKEY
     last_party_size: int = DEFAULT_PARTY_SIZE
     capture_enabled: bool = True
     window_pos: list[int] | None = field(default=None)
+    # 사용자가 아이콘(접힌 상태)을 끌어다 놓은 위치. 없으면 창 왼쪽 위에 접힌다.
+    icon_pos: list[int] | None = field(default=None)
 
     @classmethod
     def from_dict(cls, data: object) -> "Config":
@@ -52,13 +65,8 @@ class Config:
             capture = data["capture_enabled"]
             # 값이 잘못됐으면 안전한 쪽(붙여넣기 전용 모드)으로 둔다.
             cfg.capture_enabled = capture if isinstance(capture, bool) else False
-        pos = data.get("window_pos")
-        if (
-            isinstance(pos, list)
-            and len(pos) == 2
-            and all(isinstance(v, int) and not isinstance(v, bool) for v in pos)
-        ):
-            cfg.window_pos = [pos[0], pos[1]]
+        cfg.window_pos = _point_or_none(data.get("window_pos"))
+        cfg.icon_pos = _point_or_none(data.get("icon_pos"))
         return cfg
 
     def to_dict(self) -> dict:

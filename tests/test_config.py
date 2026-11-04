@@ -11,10 +11,30 @@ def test_defaults_when_missing(tmp_path):
 
 def test_roundtrip(tmp_path):
     path = tmp_path / "config.json"
-    save_config(Config(hotkey="Ctrl+Shift+A", last_party_size=8, capture_enabled=False, window_pos=[10, 20]), path)
+    cfg = Config(hotkey="Ctrl+Shift+A", last_party_size=8, capture_enabled=False, window_pos=[10, 20], icon_pos=[30, 40])
+    save_config(cfg, path)
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data == {"hotkey": "Ctrl+Shift+A", "last_party_size": 8, "capture_enabled": False, "window_pos": [10, 20]}
-    assert load_config(path) == Config("Ctrl+Shift+A", 8, False, [10, 20])
+    assert data == {
+        "hotkey": "Ctrl+Shift+A",
+        "last_party_size": 8,
+        "capture_enabled": False,
+        "window_pos": [10, 20],
+        "icon_pos": [30, 40],
+    }
+    assert load_config(path) == cfg
+
+
+def test_old_config_without_icon_pos_still_loads(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"hotkey": "F8", "last_party_size": 4, "capture_enabled": True, "window_pos": [1, 2]}), "utf-8")
+    cfg = load_config(path)
+    assert cfg.window_pos == [1, 2] and cfg.icon_pos is None
+
+
+def test_invalid_icon_pos_is_ignored(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"icon_pos": [1, "2"]}), "utf-8")
+    assert load_config(path).icon_pos is None
 
 
 def test_invalid_values_fall_back_safely(tmp_path):
