@@ -1,0 +1,193 @@
+"""테두리 없는 창, 닫기/접기 버튼, 아이콘 미니 모드 테스트 (offscreen)."""
+
+from __future__ import annotations
+
+from collections import Counter
+
+import pytest
+from PIL import Image
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor
+
+from loa_auction import capture, hotkey
+from loa_auction.config import Config, load_config, save_config
+from loa_auction.history import HistoryStore
+from loa_auction.ocr import OcrResult
+from loa_auction.ui import WINDOW_BG, IconBubble, MiniWindow
+
+
+@pytest.fixture
+def make_window(qtbot, tmp_path):
+    path = tmp_path / "config.json"
+
+    def factory(config: Config | None = None) -> MiniWindow:
+        cfg = config or Config(capture_enabled=False)
+        save_config(cfg, path)
+        win = MiniWindow(load_config(path), path, HistoryStore(tmp_path / "history.csv"))
+        qtbot.addWidget(win)
+        qtbot.addWidget(win.bubble)
+        return win
+
+    factory.config_path = path
+    return factory
+
+
+def test_window_has_no_title_bar_and_stays_on_top(make_window):
+    win = make_window()
+    flags = win.windowFlags()
+    assert flags & Qt.WindowType.FramelessWindowHint
+    assert flags & Qt.WindowType.WindowStaysOnTopHint
+    assert win.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert win.close_button.text() == "✕" and win.collapse_button.text() == "—"
+
+
+def test_rounded_background_is_painted(qtbot, make_window):
+    win = make_window()
+    win.show()
+    image = win.grab().toImage()
+    assert image.pixelColor(0, 0).alpha() == 0  # 둥근 모서리 바깥은 투명
+    center = image.pixelColor(image.width() // 2, image.height() - 3)
+    assert center.alpha() == 255
+    assert abs(center.red() - QColor(WINDOW_BG).red()) < 6
+
+
+def test_item_name_row_is_drag_handle_not_text_selection(make_window):
+    win = make_window()
+    assert win.item_label.textInteractionFlags() == Qt.TextInteractionFlag.NoTextInteraction
+    assert win.item_label.parentWidget() is win.header
+
+
+def test_dragging_header_moves_window(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(100, 100)
+    start = win.pos()
+    qtbot.mousePress(win.header, Qt.MouseButton.LeftButton, pos=QPoint(60, 5))
+    qtbot.mouseMove(win.header, QPoint(100, 25))
+    qtbot.mouseRelease(win.header, Qt.MouseButton.LeftButton, pos=QPoint(100, 25))
+    assert win.pos() == start + QPoint(40, 20)
+
+
+def test_close_button_saves_and_asks_app_to_quit(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(150, 90)
+    with qtbot.waitSignal(win.exitRequested, timeout=1000):
+        qtbot.mouseClick(win.close_button, Qt.MouseButton.LeftButton)
+    assert not win.isVisible()
+    assert load_config(make_window.config_path).window_pos == [150, 90]
+
+
+def test_collapse_shows_small_icon_in_place(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    qtbot.mouseClick(win.collapse_button, Qt.MouseButton.LeftButton)
+    assert win.collapsed
+    assert not win.isVisible()
+    bubble = win.bubble
+    assert bubble.isVisible()
+    assert bubble.pos() == QPoint(200, 120)
+    assert bubble.size().width() == IconBubble.SIZE == bubble.size().height()
+    flags = bubble.windowFlags()
+    assert flags & Qt.WindowType.WindowStaysOnTopHint
+    assert flags & Qt.WindowType.FramelessWindowHint
+    assert (flags & Qt.WindowType.Tool) == Qt.WindowType.Tool  # 작업 표시줄에 따로 나오지 않음
+
+
+def test_clicking_icon_restores_window_with_collapse_button(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    qtbot.mouseClick(win.bubble, Qt.MouseButton.LeftButton)
+    assert not win.collapsed
+    assert win.isVisible() and not win.bubble.isVisible()
+    assert win.pos() == QPoint(200, 120)
+    assert win.collapse_button.isVisible()  # 다시 접을 수 있다
+    win.collapse_button.click()
+    assert win.collapsed and win.bubble.isVisible()
+
+
+def test_dragging_icon_moves_it_without_expanding(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(200, 120)
+    win.collapse()
+    bubble = win.bubble
+    qtbot.mousePress(bubble, Qt.MouseButton.LeftButton, pos=QPoint(20, 20))
+    qtbot.mouseMove(bubble, QPoint(60, 50))
+    qtbot.mouseRelease(bubble, Qt.MouseButton.LeftButton, pos=QPoint(60, 50))
+    assert win.collapsed  # 끌기는 클릭이 아니다
+    assert bubble.pos() == QPoint(240, 150)
+    qtbot.mouseClick(bubble, Qt.MouseButton.LeftButton)
+    assert not win.collapsed
+    assert win.pos() == win._fit_on_screen(QPoint(240, 150))
+
+
+def test_expand_keeps_window_on_screen(make_window):
+    win = make_window()
+    win.show()
+    win.collapse()
+    screen = win.screen().availableGeometry()
+    win.bubble.move(screen.right() - 10, screen.bottom() - 10)  # 화면 오른쪽 아래 구석
+    win.expand()
+    assert screen.contains(win.frameGeometry())
+
+
+def test_icon_menu_has_expand_and_exit(qtbot, make_window):
+    win = make_window()
+    win.show()
+    win.move(210, 130)
+    win.collapse()
+    menu = win.bubble.build_menu()
+    actions = {a.text(): a for a in menu.actions() if a.text()}
+    assert set(actions) == {"펼치기", "종료"}
+    actions["펼치기"].trigger()
+    assert not win.collapsed
+    win.collapse()
+    with qtbot.waitSignal(win.exitRequested, timeout=1000):
+        win.bubble.build_menu().actions()[-1].trigger()  # 종료
+    assert not win.bubble.isVisible() and not win.isVisible()
+    assert load_config(make_window.config_path).window_pos == [210, 130]  # 아이콘 위치 저장
+
+
+def test_icon_menu_is_dark_and_readable(make_window):
+    win = make_window()
+    win.collapse()
+    menu = win.bubble.build_menu()
+    menu.adjustSize()
+    image = menu.grab().toImage()
+    background = image.pixelColor(image.width() - 4, image.height() // 2)
+    assert background.lightness() < 80  # 흰 글자가 보이는 어두운 바탕(창과 같은 색 계열)
+
+
+def test_result_while_collapsed_opens_window(make_window):
+    win = make_window()
+    win.show()
+    win.collapse()
+    win._busy = True
+    win._on_ocr_finished(OcrResult("유물 결투의 대가 각인서", 17500, True))
+    assert not win.collapsed and win.isVisible()
+    assert win.bid_label.text() == "11,335"
+
+
+def test_hotkey_still_works_while_collapsed(qtbot, make_window, monkeypatch):
+    calls = Counter()
+    monkeypatch.setattr(hotkey, "_register_hotkey", lambda *a: calls.update(["register"]) or (True, 0))
+    monkeypatch.setattr(hotkey, "_unregister_hotkey", lambda *a: True)
+
+    def fake_grab():
+        calls["grab"] += 1
+        return Image.new("RGB", (640, 360), (5, 5, 5))
+
+    monkeypatch.setattr(capture, "grab_primary_monitor", fake_grab)
+    win = make_window(Config(capture_enabled=True))
+    win.show()
+    win.collapse()
+    qtbot.wait(300)
+    assert calls["grab"] == 0  # 접혀 있어도 저절로 캡처하지 않는다
+    win._hotkey.activated.emit()  # F8
+    assert calls["grab"] == 1
+    qtbot.waitUntil(lambda: not win.busy, timeout=30000)
+    assert not win.collapsed and win.isVisible()  # 결과(여기서는 인식 실패)를 보여 주려고 펼침
