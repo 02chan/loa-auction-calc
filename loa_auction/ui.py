@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 
 from . import capture, ocr
 from . import hotkey as hotkey_mod
-from .calc import calculate
+from .calc import CalcResult, calculate
 from .config import Config, save_config
 from .history import HistoryStore
 from .ocr import OcrResult, OcrUnavailableError
@@ -57,6 +57,8 @@ QPushButton:checked {{ background: {GOLD}; color: #1d1f26; font-weight: bold; bo
 QLabel#ItemName {{ font-weight: bold; font-size: 10pt; }}
 QLabel#Bid {{ color: {GOLD}; font-size: 26pt; font-weight: bold; }}
 QLabel#Caption, QLabel#Small {{ color: #a8acb8; }}
+QLabel#Small:hover {{ color: #ffffff; text-decoration: underline; }}
+QLabel#Bid:hover {{ color: #ffd86b; }}
 QLabel#Status {{ color: #9aa0ad; font-size: 8pt; }}
 QToolButton {{ border: none; color: #a8acb8; }}
 QTableWidget {{ background: #23262e; gridline-color: #333743; font-size: 8pt; }}
@@ -104,16 +106,40 @@ class PriceEdit(QLineEdit):
 
     pasteRequested = Signal()
 
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        # 이 창이 방금 클립보드에 복사한 숫자. 이 값은 가격 칸에 다시 붙이지 않는다
+        # (새 캡처 없이 Ctrl+V를 눌렀을 때 입찰가가 가격으로 들어가는 실수 방지).
+        self.own_copied_text: str | None = None
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.matches(QKeySequence.StandardKey.Paste):
             digits = _clipboard_digits()
-            if digits is not None and not _clipboard_has_image():
+            if digits is not None and digits != self.own_copied_text and not _clipboard_has_image():
                 self.insert(digits)
             else:
                 self.pasteRequested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class CopyLabel(QLabel):
+    """클릭하면 clicked 시그널을 내는 숫자 라벨(값 복사용)."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("클릭하면 숫자를 쉼표 없이 복사합니다")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setProperty("copyable", True)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class _ActualPriceDelegate(QStyledItemDelegate):
@@ -172,6 +198,8 @@ class MiniWindow(QWidget):
         self._task: OcrTask | None = None
         self._filling_table = False
         self._history_dirty = False
+        self.result: CalcResult | None = None  # 현재 표시 중인 계산 결과
+        self._price_edited = False
 
         self.setObjectName("MiniWindow")
         self.setWindowTitle("로아 경매 계산기")
@@ -206,6 +234,8 @@ class MiniWindow(QWidget):
         self.price_edit.setPlaceholderText("숫자 입력")
         self.price_edit.setValidator(QRegularExpressionValidator(r"\d{0,10}", self.price_edit))
         self.price_edit.textChanged.connect(self.recalculate)
+        self.price_edit.textEdited.connect(self._on_price_edited)  # 사용자가 직접 고칠 때만
+        self.price_edit.editingFinished.connect(self._on_price_edit_finished)
         self.price_edit.pasteRequested.connect(self.paste_from_clipboard)
         self.btn4 = QPushButton("4인")
         self.btn8 = QPushButton("8인")
@@ -216,7 +246,7 @@ class MiniWindow(QWidget):
             btn.setFixedWidth(44)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.party_group.addButton(btn, size)
-        self.party_group.idClicked.connect(self.set_party_size)
+        self.party_group.idClicked.connect(self._on_party_clicked)
         row.addWidget(caption)
         row.addWidget(self.price_edit, 1)
         row.addWidget(self.btn4)
@@ -225,8 +255,9 @@ class MiniWindow(QWidget):
 
         bid_caption = QLabel("추천 입찰가")
         bid_caption.setObjectName("Caption")
-        self.bid_label = QLabel("-")
+        self.bid_label = CopyLabel("-")
         self.bid_label.setObjectName("Bid")
+        self.bid_label.clicked.connect(self.copy_recommended_bid)
         self.bid_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         bid_font = QFont(self.bid_label.font())
         bid_font.setPointSize(26)
@@ -238,10 +269,12 @@ class MiniWindow(QWidget):
         root.addLayout(bid_row)
 
         small = QHBoxLayout()
-        self.sell_label = QLabel("판매 손익분기 -")
-        self.use_label = QLabel("사용 손익분기 -")
+        self.sell_label = CopyLabel("판매 손익분기 -")
+        self.use_label = CopyLabel("사용 손익분기 -")
         for lbl in (self.sell_label, self.use_label):
             lbl.setObjectName("Small")
+        self.sell_label.clicked.connect(self.copy_sell_breakeven)
+        self.use_label.clicked.connect(self.copy_use_breakeven)
         small.addWidget(self.sell_label)
         small.addStretch(1)
         small.addWidget(self.use_label)
@@ -311,14 +344,63 @@ class MiniWindow(QWidget):
     def recalculate(self) -> None:
         price = self.current_price()
         if price is None:
+            self.result = None
             self.bid_label.setText("-")
             self.sell_label.setText("판매 손익분기 -")
             self.use_label.setText("사용 손익분기 -")
             return
-        result = calculate(price, self.party_size)
-        self.bid_label.setText(_fmt(result.recommended_bid))
-        self.sell_label.setText(f"판매 손익분기 {_fmt(result.sell_breakeven)}")
-        self.use_label.setText(f"사용 손익분기 {_fmt(result.use_breakeven)}")
+        self.result = calculate(price, self.party_size)
+        self.bid_label.setText(_fmt(self.result.recommended_bid))
+        self.sell_label.setText(f"판매 손익분기 {_fmt(self.result.sell_breakeven)}")
+        self.use_label.setText(f"사용 손익분기 {_fmt(self.result.use_breakeven)}")
+
+    @Slot(int)
+    def _on_party_clicked(self, size: int) -> None:
+        self.set_party_size(size)
+        self.copy_recommended_bid()
+
+    @Slot()
+    def _on_price_edited(self) -> None:
+        self._price_edited = True
+
+    @Slot()
+    def _on_price_edit_finished(self) -> None:
+        """가격을 직접 고치고 Enter를 누르거나 칸을 벗어나면 추천 입찰가를 복사한다.
+
+        - 타자마다 복사하면 Windows 클립보드 기록이 중간 숫자로 가득 차므로 끝났을 때만 복사한다.
+        - 직접 고친 경우에만 복사한다. 게임으로 창을 옮겨 칸이 포커스를 잃는 것만으로는
+          복사하지 않는다(방금 클릭해서 복사한 손익분기 값을 덮어쓰지 않도록).
+        """
+        if self._price_edited:
+            self._price_edited = False
+            self.copy_recommended_bid()
+
+    # ------------------------------------------------------------ 클립보드 복사
+    def copy_number(self, value: int, what: str) -> str:
+        """value를 쉼표 없는 숫자 글자로 클립보드에 넣는다."""
+        text = str(value)
+        QGuiApplication.clipboard().setText(text)
+        self.price_edit.own_copied_text = text
+        self.set_status(f"{what} {text} 복사됨")
+        return text
+
+    @Slot()
+    def copy_recommended_bid(self) -> str | None:
+        if self.result is None:
+            return None
+        return self.copy_number(self.result.recommended_bid, "추천 입찰가")
+
+    @Slot()
+    def copy_sell_breakeven(self) -> str | None:
+        if self.result is None:
+            return None
+        return self.copy_number(self.result.sell_breakeven, "판매 손익분기")
+
+    @Slot()
+    def copy_use_breakeven(self) -> str | None:
+        if self.result is None:
+            return None
+        return self.copy_number(self.result.use_breakeven, "사용 손익분기")
 
     # ------------------------------------------------------------ 입력: Ctrl+V
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
@@ -419,13 +501,15 @@ class MiniWindow(QWidget):
         self.item_label.setText(name)
         self.item_label.setToolTip(name)
         self.price_edit.setText(str(result.price))  # textChanged → 즉시 재계산
-        self.set_status(f"인식 완료: {_fmt(result.price)} 골드 ({self.party_size}인)")
+        copied = self.copy_recommended_bid()
+        done = f"인식 완료: {_fmt(result.price)} 골드 ({self.party_size}인) · 추천 입찰가 {copied} 복사됨"
+        self.set_status(done)
         bid = calculate(result.price, self.party_size).recommended_bid
         try:
             added = self.history.append(result.item_name, result.price, self.party_size, bid)
         except OSError as exc:
             self.set_status(
-                f"인식 완료: {_fmt(result.price)} 골드. 기록 저장 실패 "
+                f"{done}. 기록 저장 실패 "
                 f"(history.csv가 다른 프로그램에서 열려 있는지 확인하세요: {exc.strerror or exc})"
             )
             return

@@ -155,11 +155,111 @@ def test_ctrl_v_fixture_fills_price_and_bid(qtbot, make_window, path, target):
     expected_item = EXPECTED_ITEM_SUBSTRING.get(path.name)
     if expected_item:
         assert expected_item in win.item_label.text()
+    # 추천 입찰가가 쉼표 없이 클립보드에 자동 복사된다
+    assert QGuiApplication.clipboard().text() == str(calculate(price, win.party_size).recommended_bid)
     rows = HistoryStore(make_window.history_path).rows()
     assert len(rows) == 1
     assert rows[0].price == price and rows[0].party_size == win.party_size
     assert rows[0].recommended_bid == calculate(price, win.party_size).recommended_bid
     assert rows[0].actual_price is None
+
+
+# ---------------------------------------------------------------- 클립보드 복사
+
+
+def clipboard_text() -> str:
+    return QGuiApplication.clipboard().text()
+
+
+def test_ocr_success_copies_recommended_bid_without_commas(make_window):
+    win = make_window()
+    win.btn4.click()
+    QGuiApplication.clipboard().setText("before")
+    win._busy = True
+    win._on_ocr_finished(OcrResult("유물 결투의 대가 각인서", 17500, True))
+    assert win.bid_label.text() == "11,335"
+    assert clipboard_text() == "11335"
+    assert "11335 복사됨" in win.status_label.text()
+
+
+def test_ocr_failure_does_not_touch_clipboard(make_window):
+    win = make_window()
+    QGuiApplication.clipboard().setText("before")
+    win._busy = True
+    win._on_ocr_finished(OcrResult.failed())
+    assert clipboard_text() == "before"
+
+
+def test_party_toggle_copies_new_bid(make_window):
+    win = make_window()
+    win.price_edit.setText("7776")
+    QGuiApplication.clipboard().setText("before")
+    win.btn8.click()
+    assert clipboard_text() == "5876"
+    win.btn4.click()
+    assert clipboard_text() == "5036"
+
+
+def test_party_toggle_without_price_copies_nothing(make_window):
+    win = make_window()
+    QGuiApplication.clipboard().setText("before")
+    win.btn8.click()
+    assert clipboard_text() == "before"
+
+
+def test_manual_price_edit_copies_bid_only_when_finished(qtbot, make_window):
+    win = make_window()
+    win.btn4.click()
+    QGuiApplication.clipboard().setText("before")
+    qtbot.keyClicks(win.price_edit, "7776")
+    assert clipboard_text() == "before"  # 타자마다 복사하지 않는다
+    qtbot.keyClick(win.price_edit, Qt.Key.Key_Return)
+    assert clipboard_text() == "5036"
+
+
+def test_focus_loss_without_edit_keeps_clicked_value(qtbot, make_window):
+    win = make_window()
+    win.btn4.click()
+    win.price_edit.setText("7776")  # 인식 결과처럼 코드로 채운 가격
+    qtbot.mouseClick(win.sell_label, Qt.MouseButton.LeftButton)
+    assert clipboard_text() == "5540"
+    win.price_edit.editingFinished.emit()  # 게임으로 창을 옮겨 가격 칸이 포커스를 잃은 상황
+    assert clipboard_text() == "5540"
+
+
+@pytest.mark.parametrize(
+    ("label", "field"),
+    [("sell_label", "sell_breakeven"), ("use_label", "use_breakeven"), ("bid_label", "recommended_bid")],
+)
+@pytest.mark.parametrize("party", [4, 8])
+def test_click_number_copies_without_commas(qtbot, make_window, label, field, party):
+    win = make_window()
+    win.party_group.button(party).click()
+    win.price_edit.setText("1234567")
+    QGuiApplication.clipboard().setText("before")
+    qtbot.mouseClick(getattr(win, label), Qt.MouseButton.LeftButton)
+    expected = getattr(calculate(1234567, party), field)
+    assert "," in getattr(win, label).text()  # 화면에는 쉼표 표기
+    assert clipboard_text() == str(expected)  # 복사본은 쉼표 없음
+    assert f"{expected} 복사됨" in win.status_label.text()
+
+
+def test_click_number_without_price_copies_nothing(qtbot, make_window):
+    win = make_window()
+    QGuiApplication.clipboard().setText("before")
+    for label in (win.sell_label, win.use_label, win.bid_label):
+        qtbot.mouseClick(label, Qt.MouseButton.LeftButton)
+    assert clipboard_text() == "before"
+
+
+def test_ctrl_v_with_own_copied_number_is_not_pasted_as_price(qtbot, make_window):
+    win = make_window()
+    win.price_edit.setText("7776")
+    win.btn4.click()  # 추천 입찰가 5036이 클립보드에 들어간다
+    assert clipboard_text() == "5036"
+    qtbot.keyClick(win.price_edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    assert win.price_edit.text() == "7776"
+    assert "클립보드에 이미지가 없습니다" in win.status_label.text()
 
 
 def test_ocr_runs_off_the_ui_thread(qtbot, make_window):
