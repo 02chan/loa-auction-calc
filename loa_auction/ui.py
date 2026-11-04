@@ -1,0 +1,561 @@
+"""항상 위에 떠 있는 미니 창.
+
+입력 경로는 두 가지뿐이다.
+- Ctrl+V: 클립보드 이미지 → OCR → 계산
+- 전역 단축키(기본 F8): 주 모니터를 그 순간 1회 캡처 → OCR → 계산
+  (config.capture_enabled=false 인 "붙여넣기 전용 모드"에서는 단축키 등록·캡처를 하지 않는다)
+
+게임 창에는 아무것도 보내지 않는다. 이 창은 숫자를 보여 주기만 하고 입찰은 사람이 한다.
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Callable
+
+from PIL import Image
+from PySide6.QtCore import QMetaObject, QObject, QPoint, QRunnable, Qt, QThreadPool, Signal, Slot
+from PySide6.QtGui import QFont, QGuiApplication, QKeyEvent, QKeySequence, QRegularExpressionValidator
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QButtonGroup,
+    QCheckBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import capture, ocr
+from . import hotkey as hotkey_mod
+from .calc import calculate
+from .config import Config, save_config
+from .history import HistoryStore
+from .ocr import OcrResult, OcrUnavailableError
+
+GOLD = "#F5C242"  # 골드 아이콘 색
+RECENT_COUNT = 10
+FAIL_TEXT = "인식 실패"
+NO_IMAGE_TEXT = "클립보드에 이미지가 없습니다. Win+Shift+S로 경매 창을 캡처한 뒤 Ctrl+V 하세요."
+
+STYLE = f"""
+QWidget#MiniWindow {{ background: #1d1f26; }}
+QWidget {{ color: #e6e6e6; font-family: 'Malgun Gothic'; font-size: 9pt; }}
+QLineEdit {{ background: #2a2d36; border: 1px solid #3c404c; border-radius: 4px; padding: 3px 6px; font-size: 11pt; }}
+QLineEdit:focus {{ border-color: {GOLD}; }}
+QPushButton {{ background: #2a2d36; border: 1px solid #3c404c; border-radius: 4px; padding: 4px 0; }}
+QPushButton:checked {{ background: {GOLD}; color: #1d1f26; font-weight: bold; border-color: {GOLD}; }}
+QLabel#ItemName {{ font-weight: bold; font-size: 10pt; }}
+QLabel#Bid {{ color: {GOLD}; font-size: 26pt; font-weight: bold; }}
+QLabel#Caption, QLabel#Small {{ color: #a8acb8; }}
+QLabel#Status {{ color: #9aa0ad; font-size: 8pt; }}
+QToolButton {{ border: none; color: #a8acb8; }}
+QTableWidget {{ background: #23262e; gridline-color: #333743; font-size: 8pt; }}
+QHeaderView::section {{ background: #2a2d36; color: #a8acb8; border: none; padding: 2px; font-size: 8pt; }}
+QCheckBox {{ color: #a8acb8; font-size: 8pt; }}
+"""
+
+
+def _fmt(value: int) -> str:
+    return f"{value:,}"
+
+
+class _OcrSignals(QObject):
+    finished = Signal(object)  # OcrResult
+    unavailable = Signal(str)
+    failed = Signal(str)
+
+
+class OcrTask(QRunnable):
+    """OCR을 스레드풀에서 실행한다(UI 스레드를 멈추지 않도록)."""
+
+    def __init__(self, image: Image.Image, ocr_func: Callable[[Image.Image], OcrResult]):
+        super().__init__()
+        self.image = image
+        self.ocr_func = ocr_func
+        self.signals = _OcrSignals()
+
+    def run(self) -> None:
+        try:
+            result = self.ocr_func(self.image)
+        except OcrUnavailableError as exc:
+            self.signals.unavailable.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001 - UI에 오류를 표시한다
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.signals.finished.emit(result)
+
+
+class PriceEdit(QLineEdit):
+    """숫자만 받는 가격 칸.
+
+    Ctrl+V: 클립보드가 숫자 글자면 가격으로 붙여 넣고, 그 밖(이미지·다른 글자·빈 클립보드)은
+    창으로 넘겨 이미지 인식 또는 안내 문구를 처리하게 한다.
+    """
+
+    pasteRequested = Signal()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.Paste):
+            digits = _clipboard_digits()
+            if digits is not None and not _clipboard_has_image():
+                self.insert(digits)
+            else:
+                self.pasteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _ActualPriceDelegate(QStyledItemDelegate):
+    """실제낙찰가 편집기. 편집을 시작한 기록 행 번호를 기억해, 편집 중 표가 다시 그려져도
+    엉뚱한 행에 저장되지 않게 한다."""
+
+    def __init__(self, on_commit: Callable[[int, str], None], parent=None):
+        super().__init__(parent)
+        self._on_commit = on_commit
+
+    def createEditor(self, parent, option, index):  # noqa: N802
+        editor = QLineEdit(parent)
+        editor.setValidator(QRegularExpressionValidator(r"[\d,]{0,13}", editor))
+        editor.setProperty("history_index", index.data(Qt.ItemDataRole.UserRole))
+        return editor
+
+    def setEditorData(self, editor, index):  # noqa: N802
+        if not editor.property("initialized"):
+            editor.setText(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            editor.setProperty("initialized", True)
+
+    def setModelData(self, editor, model, index):  # noqa: N802
+        history_index = editor.property("history_index")
+        if history_index is not None:
+            self._on_commit(int(history_index), editor.text())
+
+
+def _clipboard_has_image() -> bool:
+    mime = QGuiApplication.clipboard().mimeData()
+    return mime is not None and mime.hasImage()
+
+
+def _clipboard_digits() -> str | None:
+    text = QGuiApplication.clipboard().text().replace(",", "").strip()
+    return text if text.isdigit() else None
+
+
+class MiniWindow(QWidget):
+    COL_TIME, COL_ITEM, COL_PRICE, COL_PARTY, COL_BID, COL_ACTUAL = range(6)
+
+    def __init__(
+        self,
+        config: Config,
+        config_path: Path,
+        history: HistoryStore,
+        ocr_func: Callable[[Image.Image], OcrResult] | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.config = config
+        self.config_path = Path(config_path)
+        self.history = history
+        self._ocr_func = ocr_func or ocr.recognize
+        self._hotkey: hotkey_mod.GlobalHotkey | None = None
+        self._busy = False
+        self._task: OcrTask | None = None
+        self._filling_table = False
+        self._history_dirty = False
+
+        self.setObjectName("MiniWindow")
+        self.setWindowTitle("로아 경매 계산기")
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(STYLE)
+        self._build_ui()
+        self.resize(320, 240)
+        self._restore_position()
+
+        self.set_party_size(self.config.last_party_size, save=False)
+        self.paste_only_check.setChecked(not self.config.capture_enabled)
+        self.paste_only_check.toggled.connect(self._on_paste_only_toggled)
+        self.refresh_history()
+        self._setup_hotkey()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 6)
+        root.setSpacing(5)
+
+        self.item_label = QLabel("경매 화면을 캡처하세요")
+        self.item_label.setObjectName("ItemName")
+        self.item_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(self.item_label)
+
+        row = QHBoxLayout()
+        caption = QLabel("거래소 가격")
+        caption.setObjectName("Caption")
+        self.price_edit = PriceEdit()
+        self.price_edit.setPlaceholderText("숫자 입력")
+        self.price_edit.setValidator(QRegularExpressionValidator(r"\d{0,10}", self.price_edit))
+        self.price_edit.textChanged.connect(self.recalculate)
+        self.price_edit.pasteRequested.connect(self.paste_from_clipboard)
+        self.btn4 = QPushButton("4인")
+        self.btn8 = QPushButton("8인")
+        self.party_group = QButtonGroup(self)
+        self.party_group.setExclusive(True)
+        for size, btn in ((4, self.btn4), (8, self.btn8)):
+            btn.setCheckable(True)
+            btn.setFixedWidth(44)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.party_group.addButton(btn, size)
+        self.party_group.idClicked.connect(self.set_party_size)
+        row.addWidget(caption)
+        row.addWidget(self.price_edit, 1)
+        row.addWidget(self.btn4)
+        row.addWidget(self.btn8)
+        root.addLayout(row)
+
+        bid_caption = QLabel("추천 입찰가")
+        bid_caption.setObjectName("Caption")
+        self.bid_label = QLabel("-")
+        self.bid_label.setObjectName("Bid")
+        self.bid_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bid_font = QFont(self.bid_label.font())
+        bid_font.setPointSize(26)
+        bid_font.setBold(True)
+        self.bid_label.setFont(bid_font)
+        bid_row = QHBoxLayout()
+        bid_row.addWidget(bid_caption, 0, Qt.AlignmentFlag.AlignBottom)
+        bid_row.addWidget(self.bid_label, 1)
+        root.addLayout(bid_row)
+
+        small = QHBoxLayout()
+        self.sell_label = QLabel("판매 손익분기 -")
+        self.use_label = QLabel("사용 손익분기 -")
+        for lbl in (self.sell_label, self.use_label):
+            lbl.setObjectName("Small")
+        small.addWidget(self.sell_label)
+        small.addStretch(1)
+        small.addWidget(self.use_label)
+        root.addLayout(small)
+
+        opts = QHBoxLayout()
+        self.history_toggle = QToolButton()
+        self.history_toggle.setCheckable(True)
+        self.history_toggle.setText("▸ 최근 기록")
+        self.history_toggle.toggled.connect(self._on_history_toggled)
+        self.paste_only_check = QCheckBox("붙여넣기 전용 모드")
+        self.paste_only_check.setToolTip("켜면 단축키 등록과 화면 캡처를 하지 않고 Ctrl+V만 받습니다.")
+        opts.addWidget(self.history_toggle)
+        opts.addStretch(1)
+        opts.addWidget(self.paste_only_check)
+        root.addLayout(opts)
+
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setHorizontalHeaderLabels(["시각", "아이템", "최저가", "인원", "추천가", "실제낙찰가"])
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.AnyKeyPressed
+        )
+        self._actual_delegate = _ActualPriceDelegate(self._commit_actual_price, self.history_table)
+        self.history_table.setItemDelegateForColumn(self.COL_ACTUAL, self._actual_delegate)
+        # 편집기가 닫힌 뒤(이벤트 루프 다음 차례) 미뤄 둔 표 갱신을 한다.
+        self._actual_delegate.closeEditor.connect(self._on_editor_closed, Qt.ConnectionType.QueuedConnection)
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_ITEM, QHeaderView.ResizeMode.Stretch)
+        self.history_table.itemChanged.connect(self._on_history_item_changed)
+        self.history_table.setVisible(False)
+        self.history_table.setMinimumHeight(180)
+        root.addWidget(self.history_table, 1)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("Status")
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+    # ------------------------------------------------------------ 계산
+    @property
+    def party_size(self) -> int:
+        return self.config.last_party_size
+
+    @Slot(int)
+    def set_party_size(self, size: int, save: bool = True) -> None:
+        if size not in (4, 8):
+            return
+        self.config.last_party_size = size
+        button = self.party_group.button(size)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        if save:
+            self.save_config()
+        self.recalculate()
+
+    def current_price(self) -> int | None:
+        text = self.price_edit.text().replace(",", "").strip()
+        return int(text) if text.isdigit() else None
+
+    @Slot()
+    def recalculate(self) -> None:
+        price = self.current_price()
+        if price is None:
+            self.bid_label.setText("-")
+            self.sell_label.setText("판매 손익분기 -")
+            self.use_label.setText("사용 손익분기 -")
+            return
+        result = calculate(price, self.party_size)
+        self.bid_label.setText(_fmt(result.recommended_bid))
+        self.sell_label.setText(f"판매 손익분기 {_fmt(result.sell_breakeven)}")
+        self.use_label.setText(f"사용 손익분기 {_fmt(result.use_breakeven)}")
+
+    # ------------------------------------------------------------ 입력: Ctrl+V
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self.paste_from_clipboard()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    @Slot()
+    def paste_from_clipboard(self) -> bool:
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None or not mime.hasImage():
+            self.set_status(NO_IMAGE_TEXT)
+            return False
+        qimg = clipboard.image()
+        if qimg.isNull():
+            self.set_status(NO_IMAGE_TEXT)
+            return False
+        return self.start_ocr(capture.qimage_to_pil(qimg), "붙여넣기")
+
+    # ------------------------------------------------------------ 입력: 전역 단축키
+    def _setup_hotkey(self) -> None:
+        if not self.config.capture_enabled:
+            self.set_status("붙여넣기 전용 모드: Win+Shift+S로 캡처한 뒤 이 창에서 Ctrl+V 하세요.")
+            return
+        if self._hotkey is None:
+            self._hotkey = hotkey_mod.GlobalHotkey(self)
+            self._hotkey.activated.connect(self._on_hotkey_activated)
+        key = self.config.hotkey
+        try:
+            ok = self._hotkey.register(key)
+        except ValueError as exc:
+            self.set_status(f"단축키 설정 오류({key}): {exc}. config.json의 hotkey 값을 확인하세요.")
+            return
+        if ok:
+            self.set_status(f"{key}: 화면 캡처 후 인식 / Ctrl+V: 클립보드 이미지 인식")
+        else:
+            self.set_status(
+                f"단축키 {key} 등록 실패(다른 프로그램이 사용 중일 수 있음). "
+                "config.json의 hotkey를 바꾸거나 Ctrl+V를 쓰세요."
+            )
+
+    def _teardown_hotkey(self) -> None:
+        if self._hotkey is not None:
+            self._hotkey.unregister()
+
+    @Slot()
+    def _on_hotkey_activated(self) -> None:
+        """단축키를 누른 순간에만 화면을 1회 캡처한다."""
+        if not self.config.capture_enabled:
+            return
+        if self._busy:
+            self.set_status("이전 인식이 끝나지 않았습니다. 잠시 후 다시 누르세요.")
+            return
+        try:
+            image = capture.grab_primary_monitor()
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"화면 캡처 실패: {exc}")
+            return
+        self.start_ocr(image, "캡처")
+
+    @Slot(bool)
+    def _on_paste_only_toggled(self, paste_only: bool) -> None:
+        self.config.capture_enabled = not paste_only
+        self.save_config()
+        if paste_only:
+            self._teardown_hotkey()
+        self._setup_hotkey()
+
+    # ------------------------------------------------------------ OCR
+    def start_ocr(self, image: Image.Image, source: str) -> bool:
+        if self._busy:
+            self.set_status("이전 인식이 끝나지 않았습니다.")
+            return False
+        self._busy = True
+        self.set_status(f"인식 중… ({source})")
+        task = OcrTask(image, self._ocr_func)
+        task.signals.finished.connect(self._on_ocr_finished)
+        task.signals.unavailable.connect(self._on_ocr_unavailable)
+        task.signals.failed.connect(self._on_ocr_error)
+        self._task = task  # 시그널 객체가 끝까지 살아 있도록 참조 유지
+        QThreadPool.globalInstance().start(task)
+        return True
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    @Slot(object)
+    def _on_ocr_finished(self, result: OcrResult) -> None:
+        self._busy = False
+        if not result.success or result.price is None:
+            self.show_failure("가격을 찾지 못했습니다. 경매 창의 '거래소 최저가'가 보이게 캡처하세요.")
+            return
+        name = result.item_name or "(아이템명 미인식)"
+        self.item_label.setText(name)
+        self.item_label.setToolTip(name)
+        self.price_edit.setText(str(result.price))  # textChanged → 즉시 재계산
+        self.set_status(f"인식 완료: {_fmt(result.price)} 골드 ({self.party_size}인)")
+        bid = calculate(result.price, self.party_size).recommended_bid
+        try:
+            added = self.history.append(result.item_name, result.price, self.party_size, bid)
+        except OSError as exc:
+            self.set_status(
+                f"인식 완료: {_fmt(result.price)} 골드. 기록 저장 실패 "
+                f"(history.csv가 다른 프로그램에서 열려 있는지 확인하세요: {exc.strerror or exc})"
+            )
+            return
+        if added:
+            self.refresh_history()
+
+    @Slot(str)
+    def _on_ocr_unavailable(self, message: str) -> None:
+        self._busy = False
+        self.show_failure("한국어 OCR을 사용할 수 없습니다.")
+        self.show_ocr_unavailable(message)
+
+    @Slot(str)
+    def _on_ocr_error(self, message: str) -> None:
+        self._busy = False
+        self.show_failure(f"OCR 오류: {message}")
+
+    def show_failure(self, detail: str) -> None:
+        self.item_label.setText(FAIL_TEXT)
+        self.item_label.setToolTip("")
+        self.price_edit.clear()  # textChanged → 결과 '-'
+        self.set_status(f"{FAIL_TEXT}: {detail}")
+
+    def show_ocr_unavailable(self, message: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("한국어 OCR 필요")
+        box.setText(message)
+        box.open()  # 비모달: 이벤트 루프를 막지 않는다
+
+    # ------------------------------------------------------------ 기록
+    @Slot(bool)
+    def _on_history_toggled(self, shown: bool) -> None:
+        self.history_toggle.setText(("▾" if shown else "▸") + " 최근 기록")
+        if shown:
+            self._collapsed_size = self.size()
+            self.history_table.setVisible(True)
+            self.refresh_history()
+            self.layout().activate()
+            self.resize(max(self.width(), 420), max(self.height(), self.sizeHint().height()))
+        else:
+            self.history_table.setVisible(False)
+            self.layout().activate()
+            before = getattr(self, "_collapsed_size", self.size())
+            self.resize(before.width(), max(before.height(), self.minimumSizeHint().height()))
+
+    def refresh_history(self) -> None:
+        if self.history_table.state() == QAbstractItemView.State.EditingState:
+            self._history_dirty = True  # 편집이 끝나면 갱신한다
+            return
+        self._history_dirty = False
+        try:
+            rows = self.history.recent(RECENT_COUNT)
+        except (OSError, ValueError, csv.Error) as exc:
+            self.set_status(f"기록을 읽지 못했습니다: {exc}")
+            rows = []
+        self._filling_table = True
+        try:
+            self.history_table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                values = [
+                    row.time[11:16] if len(row.time) >= 16 else row.time,
+                    row.item_name,
+                    _fmt(row.price),
+                    f"{row.party_size}인",
+                    _fmt(row.recommended_bid),
+                    "" if row.actual_price is None else _fmt(row.actual_price),
+                ]
+                for c, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole, row.index)
+                    flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    if c == self.COL_ACTUAL:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                    if c == self.COL_ITEM:
+                        item.setToolTip(row.item_name)
+                    item.setFlags(flags)
+                    if c != self.COL_ITEM:
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    self.history_table.setItem(r, c, item)
+        finally:
+            self._filling_table = False
+
+    @Slot(QTableWidgetItem)
+    def _on_history_item_changed(self, item: QTableWidgetItem) -> None:
+        """표 칸 글자가 코드로 바뀐 경우(편집기를 거치지 않은 경우)."""
+        if self._filling_table or item.column() != self.COL_ACTUAL:
+            return
+        self._commit_actual_price(int(item.data(Qt.ItemDataRole.UserRole)), item.text())
+
+    def _commit_actual_price(self, history_index: int, text: str) -> None:
+        text = text.replace(",", "").strip()
+        if text and not text.isdigit():
+            self.set_status("실제 낙찰가는 숫자만 입력하세요.")
+        else:
+            try:
+                self.history.set_actual_price(history_index, int(text) if text else None)
+            except (IndexError, ValueError, OSError, csv.Error) as exc:
+                self.set_status(f"실제 낙찰가 저장 실패: {exc}")
+            else:
+                self.set_status("실제 낙찰가를 저장했습니다.")
+        self.refresh_history()
+        # 편집 중이라 미뤄졌다면, 편집기가 어떤 경로로 닫히든 이벤트 루프 다음 차례에 갱신한다.
+        QMetaObject.invokeMethod(self, "_on_editor_closed", Qt.ConnectionType.QueuedConnection)
+
+    @Slot()
+    def _on_editor_closed(self) -> None:
+        if self._history_dirty:
+            self.refresh_history()
+
+    # ------------------------------------------------------------ 설정/상태
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def save_config(self) -> None:
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as exc:
+            self.set_status(f"설정 저장 실패: {exc}")
+
+    def _restore_position(self) -> None:
+        pos = self.config.window_pos
+        if not pos:
+            return
+        point = QPoint(pos[0], pos[1])
+        if QGuiApplication.screenAt(point + QPoint(20, 20)) is not None:
+            self.move(point)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.config.window_pos = [self.x(), self.y()]
+        self.save_config()
+        self._teardown_hotkey()
+        super().closeEvent(event)

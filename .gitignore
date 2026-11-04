@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.exe
+history.csv
+config.json
+selftest.log
+.omc/
+fixtures/*.webp
+fixtures/*.png
+fixtures/*.jpg
+
+# 이미지는 위치와 상관없이 올리지 않는다 (게임 캡처에 개인 정보가 있을 수 있음)
+*.webp
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+
+# 테스트/임시 파일
+.pytest_cache/
+*.tmp
+*.bak
