@@ -36,21 +36,31 @@ function Invoke-Native {
     }
 }
 
+function Find-Python {
+    # Python 3.11 이상인 인터프리터를 찾는다: py 런처(-3) → python 순서.
+    $candidates = @(
+        @{ Exe = 'py'; Pre = @('-3') },
+        @{ Exe = 'python'; Pre = @() }
+    )
+    $ErrorActionPreference = 'Continue'
+    foreach ($c in $candidates) {
+        if (-not (Get-Command $c.Exe -ErrorAction SilentlyContinue)) { continue }
+        $checkArgs = @($c.Pre) + @('-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)')
+        & $c.Exe @checkArgs 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $c }
+    }
+    return $null
+}
+
 # 1) 가상환경
 $VenvPython = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $VenvPython)) {
     Write-Host '[1/4] 가상환경(.venv) 생성'
-    $created = $false
-    foreach ($launcher in @(@('py', '-3'), @('python'))) {
-        if (Get-Command $launcher[0] -ErrorAction SilentlyContinue) {
-            $launcherArgs = @()
-            if ($launcher.Count -gt 1) { $launcherArgs = $launcher[1..($launcher.Count - 1)] }
-            Invoke-Native $launcher[0] @($launcherArgs + @('-m', 'venv', (Join-Path $Root '.venv')))
-            $created = $true
-            break
-        }
-    }
-    if (-not $created) { throw 'Python 3.11 이상을 찾을 수 없습니다. https://www.python.org 에서 설치하세요.' }
+    $Python = Find-Python
+    if (-not $Python) { throw 'Python 3.11 이상을 찾을 수 없습니다. https://www.python.org 에서 설치하세요.' }
+    # 배열은 반드시 스플래팅(@변수)으로 넘겨야 인자가 하나로 합쳐지지 않는다.
+    $VenvArgs = @($Python.Pre) + @('-m', 'venv', (Join-Path $Root '.venv'))
+    Invoke-Native $Python.Exe @VenvArgs
 } else {
     Write-Host '[1/4] 기존 가상환경(.venv) 사용'
 }
