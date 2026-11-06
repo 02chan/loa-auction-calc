@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence, TypeVar
@@ -171,9 +172,14 @@ def check_ocr_available() -> None:
 
 
 def _recognize_sync(img: Image.Image) -> list[OcrLine]:
+    engine, max_dim = _create_engine()
+    return _recognize_with(engine, max_dim, img)
+
+
+def _recognize_with(engine, max_dim: int, img: Image.Image) -> list[OcrLine]:
+    """이미 만든 OCR 엔진으로 읽는다. 반드시 MTA 스레드 안에서 호출한다."""
     from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
 
-    engine, max_dim = _create_engine()
     img = img.convert("RGBA")
     scale = 1.0
     if max(img.size) > max_dim:
@@ -205,7 +211,9 @@ def recognize_lines(img: Image.Image) -> list[OcrLine]:
     """PIL 이미지를 Windows OCR(한국어)로 읽어 줄 목록을 돌려준다. 좌표는 원본 이미지 기준."""
     try:
         return _run_in_mta_thread(lambda: _recognize_sync(img))
-    except ImportError as exc:  # winrt 패키지가 빠진 경우
+    except ImportError as exc:
+        if not _is_winrt_missing(exc):
+            raise
         raise OcrUnavailableError(f"{KOREAN_OCR_HELP}\n(상세: {exc})") from exc
 
 
@@ -349,12 +357,6 @@ def read_price_right_of(label: Box, lines: Sequence[OcrLine]) -> PriceRead | Non
     return None
 
 
-def price_right_of(label: Box, lines: Sequence[OcrLine]) -> int | None:
-    """확실한(천 단위 쉼표가 있는) 가격만 돌려준다."""
-    read = read_price_right_of(label, lines)
-    return read.value if read and read.confident else None
-
-
 def _clean_item_name(text: str) -> str:
     tokens = text.split()
     # 아이콘 테두리가 "1", "|" 같은 글자로 읽히는 경우를 앞뒤에서 제거한다.
@@ -363,12 +365,6 @@ def _clean_item_name(text: str) -> str:
     while tokens and not _HANGUL_RE.search(tokens[-1]) and len(tokens[-1]) <= 2:
         tokens.pop()
     return " ".join(tokens)
-
-
-def item_name_above(label_line: OcrLine, label: Box, lines: Sequence[OcrLine]) -> str:
-    """라벨 바로 위에서 가장 가까운 텍스트 줄의 글자. 없으면 ""."""
-    line = item_line_above(label_line, label, lines)
-    return _clean_item_name(line.text) if line else ""
 
 
 def item_line_above(label_line: OcrLine, label: Box, lines: Sequence[OcrLine]) -> OcrLine | None:
@@ -536,33 +532,133 @@ def _refine_item_name(img: Image.Image, match: LabelMatch, recognize: Recognizer
     return _clean_item_name(best.text) or original
 
 
-# 전체 화면 OCR 배율. 작은 화면은 글자가 작아 라벨을 못 찾을 수 있으므로 키워 가며 다시 읽는다.
+# OCR 배율. 1배에서 라벨을 못 찾은 작은 화면은 글자가 작으므로 화면 전체를 키워 가며 다시 읽는다.
+# (큰 모니터에서 게임을 작은 창 모드로 띄운 경우에도 3배가 필요할 수 있어 상한을 넉넉히 둔다)
 _FULL_PASS_FACTORS = (1, 2, 3)
 _MAX_UPSCALED_SIDE = 8000
 
 
-def _matches_at(img: Image.Image, factor: int, recognize: Recognizer) -> list[LabelMatch]:
-    if factor == 1:
+def _panel_region(img: Image.Image, label: Box) -> tuple[int, int, int, int]:
+    """라벨 주변(위쪽 아이템명 줄 ~ 오른쪽 가격과 골드 아이콘)만 담는 영역 (x0, y0, x1, y1)."""
+    lh = max(label.height, 4.0)
+    x0 = max(0, int(label.x0 - label.width * 1.5))
+    x1 = min(img.width, int(label.x1 + _price_search_width(label) + lh))
+    y0 = max(0, int(label.y0 - lh * 5))
+    y1 = min(img.height, int(label.y1 + lh * 1.5))
+    return x0, y0, x1, y1
+
+
+def _region_anchor(matches: Sequence[LabelMatch]) -> LabelMatch | None:
+    """라벨 주변만 다시 읽어도 될 만큼 경매 창의 진짜 라벨다운 후보.
+
+    라벨 글자만 있는 줄이고 바로 위에 아이템명 줄이 있어야 한다. 채팅·다른 창에 보이는 '최저가' 글자를
+    기준으로 범위를 좁혀 버리면, 1배에서 못 읽은 진짜 라벨을 화면 전체 2·3배 재검사로도 찾지 못하게 된다.
+    """
+    for m in matches:
+        if m.item_line is not None and _PURE_LABEL_RE.match(_compact(m.line.text)):
+            return m
+    return None
+
+
+def _drop_cut_numbers(
+    lines: Sequence[OcrLine],
+    width: int,
+    height: int,
+    cut: tuple[bool, bool, bool, bool] = (True, True, True, True),
+    margin: float = 2.0,
+) -> list[OcrLine]:
+    """잘라 낸 영역 가장자리에 걸린 숫자 단어를 버린다(일부만 보였을 수 있음: "1,680,238" → "1,680").
+
+    cut: (왼쪽, 위, 오른쪽, 아래) 중 실제로 화면 안쪽을 잘라 낸 쪽. 화면 자체의 가장자리는 잘린 게 아니다.
+    오른쪽은 글자 사이 빈칸에서 잘려 멀쩡해 보이는 숫자("1,680")가 남을 수 있어 글자 높이의 60%만큼 더 본다.
+    """
+    left, top, right, bottom = cut
+    out = []
+    for line in lines:
+        words = []
+        for w in line.words:
+            if any(ch.isdigit() for ch in w.text) and (
+                (left and w.box.x0 <= margin)
+                or (top and w.box.y0 <= margin)
+                or (right and w.box.x1 >= width - max(margin, 0.6 * w.box.height))
+                or (bottom and w.box.y1 >= height - margin)
+            ):
+                continue
+            words.append(w)
+        if words:
+            out.append(OcrLine.from_words(words))
+    return out
+
+
+def _matches_at(
+    img: Image.Image, factor: int, recognize: Recognizer, region: tuple[int, int, int, int] | None = None
+) -> list[LabelMatch]:
+    """img(또는 그 안의 region)를 factor배로 키워 읽고, 좌표를 원본 기준으로 되돌린 라벨 후보들."""
+    if region is None and factor == 1:
         return parse_lines(recognize(img))
-    big = img.resize((img.width * factor, img.height * factor), Image.LANCZOS)
-    return parse_lines(_map_back(recognize(big), 0, 0, float(factor)))
+    ox, oy = (region[0], region[1]) if region else (0, 0)
+    part = img.crop(region) if region else img
+    if factor > 1:
+        part = part.resize((part.width * factor, part.height * factor), Image.LANCZOS)
+    lines = recognize(part)
+    if region is not None:
+        cut = (region[0] > 0, region[1] > 0, region[2] < img.width, region[3] < img.height)
+        lines = _drop_cut_numbers(lines, part.width, part.height, cut)
+    return parse_lines(_map_back(lines, ox, oy, float(factor)))
 
 
 def parse_image(img: Image.Image, recognize: Recognizer = recognize_lines) -> OcrResult:
-    """전체 화면 이미지에서 아이템명과 거래소 최저가를 읽는다."""
+    """전체 화면 이미지에서 아이템명과 거래소 최저가를 읽는다.
+
+    1) 화면 전체를 1배로 읽는다.
+    2) 경매 창 라벨을 못 찾았으면 화면 전체를 2배, 3배로 키워 다시 읽는다(작은 화면·작은 창 모드 대비).
+    3) 경매 창 라벨(위에 아이템명 줄이 있는 라벨 줄)은 찾았는데 가격을 확정하지 못했으면,
+       화면 전체가 아니라 그 라벨 주변만 키워 다시 읽는다(실패할 때 걸리는 시간이 크게 줄어든다).
+    """
     img = img.convert("RGB")
     item_fallback = ""
+    region: tuple[int, int, int, int] | None = None
     for factor in _FULL_PASS_FACTORS:
-        if factor > 1 and max(img.size) * factor > _MAX_UPSCALED_SIDE:
+        if region is None and factor > 1 and max(img.size) * factor > _MAX_UPSCALED_SIDE:
             break
-        for match in _matches_at(img, factor, recognize):
+        matches = _matches_at(img, factor, recognize, region)
+        for match in matches:
             item_fallback = item_fallback or match.item_name
             price = _resolve_price(img, match, recognize)
             if price is not None:
                 return OcrResult(item_name=_refine_item_name(img, match, recognize), price=price, success=True)
+        if region is None:
+            anchor = _region_anchor(matches)
+            if anchor is not None:
+                region = _panel_region(img, anchor.label)
     return OcrResult.failed(item_fallback)
 
 
+def _is_winrt_missing(exc: ImportError) -> bool:
+    """winrt 패키지(또는 그 DLL)를 불러오지 못한 경우만 'OCR을 쓸 수 없음'으로 본다."""
+    return "winrt" in (exc.name or "") or "winrt" in str(exc)
+
+
 def recognize(img: Image.Image) -> OcrResult:
-    """UI/selftest용 진입점. 한국어 OCR이 없으면 OcrUnavailableError."""
-    return parse_image(img)
+    """UI/selftest용 진입점. 한국어 OCR이 없으면 OcrUnavailableError.
+
+    한 번의 인식(OCR 여러 번)을 전용 MTA 스레드에서 통째로 실행해, OCR 엔진을 한 번만 만들어 재사용한다.
+    """
+
+    def job() -> OcrResult:
+        engine, max_dim = _create_engine()
+        try:
+            return parse_image(img, recognize=lambda part: _recognize_with(engine, max_dim, part))
+        except BaseException as exc:
+            # 예외의 traceback이 안쪽 함수들의 지역 변수(엔진 포함)를 붙잡지 않게 비운다.
+            traceback.clear_frames(exc.__traceback__)
+            raise
+        finally:
+            engine = None  # 엔진은 이 MTA 스레드에서 해제한다(람다도 같은 변수를 본다)
+
+    try:
+        return _run_in_mta_thread(job)
+    except ImportError as exc:
+        if not _is_winrt_missing(exc):
+            raise
+        raise OcrUnavailableError(f"{KOREAN_OCR_HELP}\n(상세: {exc})") from exc

@@ -6,9 +6,10 @@
 
   1) .venv 가상환경 생성(없을 때만, Python 3.11 이상)
   2) requirements-dev.txt 설치
-  3) PyInstaller --onefile --windowed → dist\LoaAuctionCalc.exe
+  3) PyInstaller(LoaAuctionCalc.spec: onefile·창 프로그램) → dist\LoaAuctionCalc.exe
      fixtures\sample_<이름>_<가격>.(webp|png|jpg) 이미지가 있으면 번들에 포함
      (이미지가 없어도 빌드는 성공하고, --selftest는 계산만 검사)
+     쓰지 않는 Qt·Pillow 파일은 spec에서 빼서 exe를 작게(=시작을 빠르게) 만든다
   4) dist\LoaAuctionCalc.exe --selftest 실행
 #>
 [CmdletBinding()]
@@ -71,38 +72,17 @@ Write-Host '[2/4] 의존성 설치'
 Invoke-Native $VenvPython -m pip install --disable-pip-version-check -q -r (Join-Path $Root 'requirements-dev.txt')
 
 # 3) PyInstaller
-Write-Host '[3/4] PyInstaller 빌드'
-$AddData = @()
-$FixtureDir = Join-Path $Root 'fixtures'
-if (Test-Path -LiteralPath $FixtureDir) {
-    Get-ChildItem -LiteralPath $FixtureDir -File |
-        Where-Object { $_.Name -match '^sample_.+_\d+\.(webp|png|jpg)$' } |
-        ForEach-Object {
-            Write-Host "  fixture 포함: $($_.Name)"
-            $AddData += @('--add-data', "$($_.FullName);fixtures")
-        }
-}
-if ($AddData.Count -eq 0) {
-    Write-Host '  fixtures 이미지 없음: OCR 샘플 없이 빌드합니다 (--selftest는 계산만 검사).'
-}
-
-# exe 아이콘: 저장소에 이미지 파일을 두지 않고 코드(loa_auction\icon.py)로 그려 만든다.
-$IconPath = Join-Path $Root 'build\icon\LoaAuctionCalc.ico'
-Invoke-Native $VenvPython -m loa_auction.icon $IconPath
-
+#    설정은 LoaAuctionCalc.spec에 있다: onefile·창 프로그램, 코드로 그린 exe 아이콘, fixture 포함,
+#    쓰지 않는 Qt·Pillow 파일 제외(번들이 작을수록 exe 시작이 빠르다).
+Write-Host '[3/4] PyInstaller 빌드 (LoaAuctionCalc.spec)'
 $PyInstallerArgs = @(
     '-m', 'PyInstaller',
     '--noconfirm', '--clean',
-    '--onefile', '--windowed',
-    '--name', 'LoaAuctionCalc',
-    '--icon', $IconPath,
     '--distpath', (Join-Path $Root 'dist'),
     '--workpath', (Join-Path $Root 'build'),
-    '--specpath', (Join-Path $Root 'build'),
-    '--paths', $Root,
-    '--collect-submodules', 'winrt',
-    '--log-level', 'WARN'
-) + $AddData + @((Join-Path $Root 'loa_auction\__main__.py'))
+    '--log-level', 'WARN',
+    (Join-Path $Root 'LoaAuctionCalc.spec')
+)
 Invoke-Native $VenvPython @PyInstallerArgs
 
 $Exe = Join-Path $Root 'dist\LoaAuctionCalc.exe'

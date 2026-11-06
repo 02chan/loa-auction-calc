@@ -81,6 +81,9 @@ QToolButton {{ border: none; color: #a8acb8; }}
 QToolButton#CollapseButton, QToolButton#CloseButton {{
     border: none; border-radius: 4px; background: transparent; color: #c9ccd6; font-size: 10pt; }}
 QToolButton#CollapseButton:hover {{ background: #343844; color: #ffffff; }}
+QToolButton#CaptureButton {{ border: 1px solid #3c404c; border-radius: 4px; background: #2a2d36;
+    color: {GOLD}; font-size: 8pt; padding: 0 6px; }}
+QToolButton#CaptureButton:hover {{ background: #343844; border-color: {GOLD}; }}
 QToolButton#CloseButton:hover {{ background: #c42b1c; color: #ffffff; }}
 QMenu {{ background: #23262e; border: 1px solid {WINDOW_BORDER}; padding: 4px; }}
 QMenu::item {{ color: #e6e6e6; padding: 5px 22px 5px 14px; border-radius: 3px; }}
@@ -117,15 +120,24 @@ class _OcrSignals(QObject):
 class OcrTask(QRunnable):
     """OCR을 스레드풀에서 실행한다(UI 스레드를 멈추지 않도록)."""
 
-    def __init__(self, image: Image.Image, ocr_func: Callable[[Image.Image], OcrResult]):
+    def __init__(self, images: Image.Image | list[Image.Image], ocr_func: Callable[[Image.Image], OcrResult]):
         super().__init__()
-        self.image = image
+        self.images = images if isinstance(images, list) else [images]
         self.ocr_func = ocr_func
         self.signals = _OcrSignals()
 
+    def _recognize_first(self) -> OcrResult:
+        """이미지(모니터)를 차례로 읽어 처음 성공한 결과. 모두 실패하면 마지막 실패 결과."""
+        result = OcrResult.failed()
+        for image in self.images:
+            result = self.ocr_func(image)
+            if result.success:
+                break
+        return result
+
     def run(self) -> None:
         try:
-            result = self.ocr_func(self.image)
+            result = self._recognize_first()
         except OcrUnavailableError as exc:
             self.signals.unavailable.emit(str(exc))
         except Exception as exc:  # noqa: BLE001 - UI에 오류를 표시한다
@@ -428,10 +440,18 @@ class MiniWindow(QWidget):
         self.close_button.setToolTip("종료")
         self.close_button.setFixedSize(24, 22)
         self.close_button.clicked.connect(self.exit_app)
-        for button in (self.collapse_button, self.close_button):
+        # 게임이 앞에 있으면 F8이 계산기로 전달되지 않을 수 있어, 마우스로 누르는 캡처 버튼을 둔다.
+        self.capture_button = QToolButton()
+        self.capture_button.setObjectName("CaptureButton")
+        self.capture_button.setText("캡처")
+        self.capture_button.setToolTip("지금 화면(모든 모니터)을 한 번 캡처해 인식합니다. 게임에서 F8이 안 먹을 때 쓰세요.")
+        self.capture_button.setFixedHeight(22)
+        self.capture_button.clicked.connect(self._on_capture_clicked)
+        for button in (self.capture_button, self.collapse_button, self.close_button):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         header_row.addWidget(icon_label)
         header_row.addWidget(self.item_label, 1)
+        header_row.addWidget(self.capture_button)
         header_row.addWidget(self.collapse_button)
         header_row.addWidget(self.close_button)
         root.addWidget(self.header)
@@ -634,6 +654,7 @@ class MiniWindow(QWidget):
 
     # ------------------------------------------------------------ 입력: 전역 단축키
     def _setup_hotkey(self) -> None:
+        self.capture_button.setVisible(self.config.capture_enabled)  # 붙여넣기 전용 모드에서는 숨김
         if not self.config.capture_enabled:
             self.set_status("붙여넣기 전용 모드: Win+Shift+S로 캡처한 뒤 이 창에서 Ctrl+V 하세요.")
             return
@@ -647,7 +668,7 @@ class MiniWindow(QWidget):
             self.set_status(f"단축키 설정 오류({key}): {exc}. config.json의 hotkey 값을 확인하세요.")
             return
         if ok:
-            self.set_status(f"{key}: 화면 캡처 후 인식 / Ctrl+V: 클립보드 이미지 인식")
+            self.set_status(f"{key} 또는 [캡처]: 화면 캡처 후 인식 / Ctrl+V: 클립보드 이미지 인식")
         else:
             self.set_status(
                 f"단축키 {key} 등록 실패(다른 프로그램이 사용 중일 수 있음). "
@@ -660,18 +681,27 @@ class MiniWindow(QWidget):
 
     @Slot()
     def _on_hotkey_activated(self) -> None:
-        """단축키를 누른 순간에만 화면을 1회 캡처한다."""
+        """단축키(F8)를 누른 순간."""
+        self.capture_and_recognize("F8")
+
+    @Slot()
+    def _on_capture_clicked(self) -> None:
+        """[캡처] 버튼을 누른 순간. 게임이 앞에 있을 때 F8이 전달되지 않는 경우에 쓴다."""
+        self.capture_and_recognize("캡처 버튼")
+
+    def capture_and_recognize(self, source: str) -> None:
+        """사용자가 누른 순간에만 모든 모니터를 1회 캡처해 인식한다."""
         if not self.config.capture_enabled:
             return
         if self._busy:
             self.set_status("이전 인식이 끝나지 않았습니다. 잠시 후 다시 누르세요.")
             return
         try:
-            image = capture.grab_primary_monitor()
+            images = capture.grab_screens()
         except Exception as exc:  # noqa: BLE001
             self.set_status(f"화면 캡처 실패: {exc}")
             return
-        self.start_ocr(image, "캡처")
+        self.start_ocr(images, source)
 
     @Slot(bool)
     def _on_paste_only_toggled(self, paste_only: bool) -> None:
@@ -682,7 +712,7 @@ class MiniWindow(QWidget):
         self._setup_hotkey()
 
     # ------------------------------------------------------------ OCR
-    def start_ocr(self, image: Image.Image, source: str) -> bool:
+    def start_ocr(self, image: Image.Image | list[Image.Image], source: str) -> bool:
         if self._busy:
             self.set_status("이전 인식이 끝나지 않았습니다.")
             return False
