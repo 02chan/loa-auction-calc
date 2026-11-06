@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 SUPERSAMPLE = 4
@@ -37,18 +37,18 @@ def _vertical_gradient(size: int, top: tuple[int, int, int], bottom: tuple[int, 
 
 
 def _radial_gold(diameter: int) -> Image.Image:
-    """왼쪽 위가 밝은 골드 원판."""
-    disc = Image.new("RGB", (diameter, diameter), GOLD)
-    px = disc.load()
-    cx = cy = diameter * 0.35
-    r_max = diameter * 0.95
-    for y in range(diameter):
-        for x in range(diameter):
-            d = min(1.0, ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 / r_max)
-            a, b = (GOLD_LIGHT, GOLD) if d < 0.5 else (GOLD, GOLD_DARK)
-            t = d / 0.5 if d < 0.5 else (d - 0.5) / 0.5
-            px[x, y] = tuple(int(p + (q - p) * t) for p, q in zip(a, b))
-    return disc
+    """왼쪽 위(지름의 35% 지점)가 밝은 골드 원판.
+
+    밝은 중심에서 멀어질수록(지름의 95%에서 끝) GOLD_LIGHT → GOLD → GOLD_DARK로 변한다.
+    픽셀마다 파이썬으로 계산하지 않고 Pillow 내장 원형 그라데이션을 늘려 잘라 쓴다(수십 배 빠름).
+    """
+    # Image.radial_gradient: 256×256, 중심 0 → 모서리(중심에서 128√2 px) 255
+    reach = diameter * 0.95
+    size = max(2, round(256 * reach / (128 * 2**0.5)))
+    gradient = Image.radial_gradient("L").resize((size, size), Image.BILINEAR)
+    left = round(size / 2 - diameter * 0.35)  # 그라데이션 중심이 원판의 (35%, 35%)에 오도록
+    distance = gradient.crop((left, left, left + diameter, left + diameter))
+    return ImageOps.colorize(distance, black=GOLD_LIGHT, mid=GOLD, white=GOLD_DARK, midpoint=128)
 
 
 def _draw(size: int) -> Image.Image:

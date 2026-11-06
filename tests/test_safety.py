@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import ast
+import os
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 import mss
@@ -45,18 +47,31 @@ FORBIDDEN = [
 ]
 
 
-def scanned_files() -> list[Path]:
-    patterns = ["*.py", "*.ps1", "*.md", "*.txt", "*.ini", "*.toml", "*.cfg", "*.spec"]
-    skip_dirs = {".venv", "build", "dist", "__pycache__", ".git", ".omc", ".pytest_cache"}
+SCAN_SUFFIXES = {".py", ".ps1", ".md", ".txt", ".ini", ".toml", ".cfg", ".spec"}
+SKIP_DIRS = {".venv", "build", "dist", "__pycache__", ".git", ".omc", ".pytest_cache"}
+
+
+@lru_cache(maxsize=1)
+def scanned_files() -> tuple[Path, ...]:
+    """검사 대상 파일. .venv 같은 폴더는 아예 들어가지 않는다(예전에는 수천 개 파일을 훑은 뒤 걸렀다)."""
     files = []
-    for pattern in patterns:
-        for path in ROOT.rglob(pattern):
-            if skip_dirs.intersection(path.relative_to(ROOT).parts):
-                continue
-            if path.resolve() == THIS_FILE:
-                continue
-            files.append(path)
-    return sorted(set(files))
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() in SCAN_SUFFIXES and path.resolve() != THIS_FILE:
+                files.append(path)
+    return tuple(sorted(files))
+
+
+@lru_cache(maxsize=1)
+def scanned_lines() -> tuple[tuple[str, int, str], ...]:
+    """(상대 경로, 줄 번호, 줄) 목록. 파일은 테스트 전체에서 한 번만 읽는다."""
+    return tuple(
+        (p.relative_to(ROOT).as_posix(), n, line)
+        for p in scanned_files()
+        for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1)
+    )
 
 
 def package_sources() -> dict[str, str]:
@@ -77,6 +92,7 @@ def test_scan_covers_all_sources():
         "loa_auction/__main__.py",
         "tests/test_ui.py",
         "build.ps1",
+        "LoaAuctionCalc.spec",
         "README.md",
     ]:
         assert required in names
@@ -85,12 +101,7 @@ def test_scan_covers_all_sources():
 
 @pytest.mark.parametrize("word", FORBIDDEN)
 def test_no_forbidden_api_strings(word):
-    hits = [
-        f"{p.relative_to(ROOT)}:{n}"
-        for p in scanned_files()
-        for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1)
-        if word in line
-    ]
+    hits = [f"{path}:{n}" for path, n, line in scanned_lines() if word in line]
     assert hits == [], f"금지 문자열 {word!r} 발견: {hits}"
 
 
@@ -124,7 +135,7 @@ def counters(monkeypatch):
 
     def fake_grab():
         calls["grab"] += 1
-        return Image.new("RGB", (800, 450), (5, 5, 5))
+        return [Image.new("RGB", (800, 450), (5, 5, 5))]
 
     def fake_mss(*args, **kwargs):
         calls["mss"] += 1
@@ -132,7 +143,7 @@ def counters(monkeypatch):
 
     monkeypatch.setattr(hotkey, "_register_hotkey", fake_register)
     monkeypatch.setattr(hotkey, "_unregister_hotkey", fake_unregister)
-    monkeypatch.setattr(capture, "grab_primary_monitor", fake_grab)
+    monkeypatch.setattr(capture, "grab_screens", fake_grab)
     monkeypatch.setattr(mss, "mss", fake_mss)
     monkeypatch.setattr(mss, "MSS", fake_mss)
     return calls
@@ -157,8 +168,10 @@ def test_paste_only_mode_never_registers_hotkey_or_captures(qtbot, tmp_path, cou
     QGuiApplication.clipboard().setImage(pil_to_qimage(Image.new("RGB", (640, 360), (20, 20, 20))))
     qtbot.keyClick(win, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
     qtbot.waitUntil(lambda: not win.busy, timeout=30000)
-    # 단축키 콜백이 어떤 경로로든 불려도 캡처하지 않는다
+    # 단축키 콜백·캡처 버튼이 어떤 경로로든 불려도 캡처하지 않는다
+    assert win.capture_button.isHidden()
     win._on_hotkey_activated()
+    win._on_capture_clicked()
     win.btn8.click()
     win.price_edit.setText("7776")
     qtbot.wait(300)
@@ -180,12 +193,13 @@ def test_paste_only_mode_never_registers_hotkey_or_captures(qtbot, tmp_path, cou
 def test_capture_enabled_mode_registers_hotkey_but_does_not_capture_until_pressed(qtbot, tmp_path, counters):
     win = make_window(qtbot, tmp_path, Config(capture_enabled=True))
     assert counters["register"] == 1
-    qtbot.wait(1500)  # 시간이 흘러도 저절로 캡처하지 않는다
+    # 이벤트 루프를 돌려도 저절로 캡처하지 않는다(타이머가 없다는 것은 아래 정적 검사에서 따로 확인)
+    qtbot.wait(500)
     assert counters["grab"] == 0
     win._hotkey.activated.emit()  # 단축키 1회 = 캡처 1회
     assert counters["grab"] == 1
     qtbot.waitUntil(lambda: not win.busy, timeout=30000)
-    qtbot.wait(500)
+    qtbot.wait(200)
     assert counters["grab"] == 1
 
 
@@ -216,18 +230,39 @@ def _call_name(call: ast.Call) -> str:
     return ""
 
 
-def test_capture_function_called_only_from_hotkey_callback():
+def test_capture_function_called_only_from_user_action():
+    """화면 캡처는 capture_and_recognize 한 곳에서만, 반복문 밖에서 호출된다."""
     sites = []
     for name, text in package_sources().items():
         tree = ast.parse(text)
         parents = _parents(tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and _call_name(node) == "grab_primary_monitor":
+            if isinstance(node, ast.Call) and _call_name(node) == "grab_screens":
                 ancestors = list(_ancestors(node, parents))
                 func = next(a for a in ancestors if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)))
                 in_loop = any(isinstance(a, LOOP_NODES) for a in ancestors)
                 sites.append((name, func.name, in_loop))
-    assert sites == [("ui.py", "_on_hotkey_activated", False)]
+    assert sites == [("ui.py", "capture_and_recognize", False)]
+
+
+def test_capture_runs_only_from_hotkey_or_capture_button():
+    """capture_and_recognize는 단축키 콜백과 [캡처] 버튼 콜백에서만 불리고, 두 콜백은 각각 그 신호에만 연결된다."""
+    tree = ast.parse(package_sources()["ui.py"])
+    parents = _parents(tree)
+    callers = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_name(node) == "capture_and_recognize":
+            func = next(a for a in _ancestors(node, parents) if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            callers.add(func.name)
+    assert callers == {"_on_hotkey_activated", "_on_capture_clicked"}
+    refs = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_on_capture_clicked"]
+    assert refs
+    for ref in refs:
+        call = parents[ref]
+        assert isinstance(call, ast.Call) and _call_name(call) == "connect", ast.unparse(call)
+        signal = call.func.value
+        assert isinstance(signal, ast.Attribute) and signal.attr == "clicked", ast.unparse(call)
+        assert isinstance(signal.value, ast.Attribute) and signal.value.attr == "capture_button", ast.unparse(call)
 
 
 def test_hotkey_callback_is_only_connected_to_hotkey_signal():
@@ -255,7 +290,7 @@ def test_mss_used_only_inside_capture_function():
                     (a for a in _ancestors(node, parents) if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef))),
                     None,
                 )
-                assert (name, func.name if func else None) == ("capture.py", "grab_primary_monitor")
+                assert (name, func.name if func else None) == ("capture.py", "grab_screens")
 
 
 def test_no_timers_in_application_code():

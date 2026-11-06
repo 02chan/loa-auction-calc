@@ -308,3 +308,145 @@ def test_parser_prefers_pure_label_over_chat_line():
 def test_parser_item_name_empty_when_nothing_above():
     [m] = ocr.parse_lines([LABEL_LINE, PRICE_LINE])
     assert m.item_name == ""
+
+
+# ---------------------------------------------------------------------------
+# 재검사 순서(parse_image) 단위 테스트: 가짜 OCR이 이미지 크기에 따라 정해진 줄을 돌려준다
+# ---------------------------------------------------------------------------
+
+W, H = 1000, 600
+ITEM_LINE = line(("유물", 150, 100, 180, 120), ("전율", 185, 100, 215, 120))
+REAL_LABEL = line(("거래소", 150, 130, 180, 142), ("최저가", 183, 130, 210, 142))
+DECOY_LABEL = line(("거래소", 800, 500, 840, 512), ("최저가", 844, 500, 880, 512))  # 위에 아이템명 줄 없음
+
+
+def scaled_lines(lines, factor):
+    return [line(*[(w.text, w.box.x0 * factor, w.box.y0 * factor, w.box.x1 * factor, w.box.y1 * factor) for w in ln.words]) for ln in lines]
+
+
+def test_decoy_label_does_not_block_whole_screen_rescan():
+    """1배에서는 다른 곳의 '최저가'(미끼)만 보이고 진짜 라벨은 2배에서야 보이는 작은 화면."""
+    calls = []
+
+    def fake_ocr(img):
+        calls.append(img.size)
+        if img.size == (W, H):
+            return [DECOY_LABEL]
+        if img.size == (W * 2, H * 2):
+            return scaled_lines([ITEM_LINE, REAL_LABEL, line(("7,776", 280, 131, 320, 142)), DECOY_LABEL], 2)
+        return []
+
+    result = ocr.parse_image(Image.new("RGB", (W, H)), recognize=fake_ocr)
+    assert result.price == 7776 and result.success
+    assert (W * 2, H * 2) in calls  # 미끼 주변만 보지 않고 화면 전체를 2배로 다시 읽었다
+
+
+def test_found_label_rescans_only_its_panel_region():
+    """진짜 라벨(위에 아이템명 줄)은 찾았는데 가격이 안 읽힐 때: 화면 전체가 아니라 라벨 주변만 키워 읽는다."""
+    calls = []
+
+    def fake_ocr(img):
+        calls.append(img.size)
+        return [ITEM_LINE, REAL_LABEL] if img.size == (W, H) else []
+
+    img = Image.new("RGB", (W, H))
+    result = ocr.parse_image(img, recognize=fake_ocr)
+    assert result.success is False and result.item_name == "유물 전율"
+    assert (W * 2, H * 2) not in calls and (W * 3, H * 3) not in calls
+    x0, y0, x1, y1 = ocr._panel_region(img, ocr._label_box(REAL_LABEL))
+    assert ((x1 - x0) * 2, (y1 - y0) * 2) in calls and ((x1 - x0) * 3, (y1 - y0) * 3) in calls
+
+
+def test_numbers_cut_by_region_edge_are_dropped():
+    lines = [
+        line(("1,680", 950, 10, 1000, 30)),  # 오른쪽 가장자리에 걸림: "1,680,238"의 일부일 수 있다
+        line(("7,776", 500, 10, 560, 30)),
+        line(("거래소", 0, 40, 40, 60), ("최저가", 44, 40, 90, 60)),  # 글자 단어는 가장자리에 걸려도 남긴다
+    ]
+    kept = ocr._drop_cut_numbers(lines, 1000, 100)
+    assert [ln.text for ln in kept] == ["7,776", "거래소 최저가"]
+
+
+def test_number_cut_in_gap_before_right_edge_is_dropped():
+    # 글자 사이 빈칸에서 잘리면 숫자 상자가 가장자리에서 몇 px 떨어져 있다(높이 20 → 12px까지 잘린 것으로 본다)
+    gap_cut = [line(("1,680", 930, 10, 990, 30))]
+    assert ocr._drop_cut_numbers(gap_cut, 1000, 100) == []
+
+
+def test_numbers_at_real_image_edge_are_kept():
+    # 영역의 오른쪽이 화면 끝이면(잘라 낸 곳이 아니면) 그 자리의 숫자는 온전하다
+    lines = [line(("17,500", 940, 10, 1000, 30))]
+    kept = ocr._drop_cut_numbers(lines, 1000, 100, cut=(True, True, False, True))
+    assert [ln.text for ln in kept] == ["17,500"]
+
+
+def test_region_read_drops_number_cut_at_crop_edge():
+    """라벨 주변 재검사에서 영역 오른쪽 끝에 걸린 숫자("1,680,238"의 앞부분)를 가격으로 쓰면 안 된다."""
+    img = Image.new("RGB", (W, H))
+    x0, y0, x1, y1 = ocr._panel_region(img, ocr._label_box(REAL_LABEL))
+    rw, rh = (x1 - x0) * 2, (y1 - y0) * 2
+
+    def fake_ocr(part):
+        if part.size == (W, H):
+            return [ITEM_LINE, REAL_LABEL]  # 1배: 진짜 라벨은 있는데 가격이 안 읽힘
+        if part.size == (rw, rh):  # 라벨 주변 2배: 영역 오른쪽 끝에 잘린 숫자가 보임
+            shifted = [line(*[(w.text, (w.box.x0 - x0) * 2, (w.box.y0 - y0) * 2, (w.box.x1 - x0) * 2, (w.box.y1 - y0) * 2) for w in ln.words]) for ln in (ITEM_LINE, REAL_LABEL)]
+            label_top, label_bottom = (130 - y0) * 2, (142 - y0) * 2
+            return shifted + [line(("1,680", rw - 110, label_top + 2, rw, label_bottom))]
+        return []
+
+    result = ocr.parse_image(img, recognize=fake_ocr)
+    assert result.success is False and result.price is None
+
+
+def test_chat_line_with_text_above_cannot_narrow_the_search():
+    """'[파티] … 거래소 최저가'처럼 라벨 글자만 있는 줄이 아니면, 위에 글자가 있어도 범위를 좁히지 않는다."""
+    chat_above = line(("어제", 780, 470, 820, 488), ("경매", 825, 470, 865, 488))
+    chat = line(("[파티]", 740, 500, 795, 512), ("거래소", 800, 500, 840, 512), ("최저가", 844, 500, 880, 512))
+    calls = []
+
+    def fake_ocr(img):
+        calls.append(img.size)
+        if img.size == (W, H):
+            return [chat_above, chat]
+        if img.size == (W * 2, H * 2):
+            return scaled_lines([ITEM_LINE, REAL_LABEL, line(("7,776", 280, 131, 320, 142)), chat_above, chat], 2)
+        return []
+
+    result = ocr.parse_image(Image.new("RGB", (W, H)), recognize=fake_ocr)
+    assert result.price == 7776
+    assert (W * 2, H * 2) in calls
+
+
+def test_non_winrt_import_error_is_not_reported_as_missing_korean_ocr(monkeypatch):
+    def broken_parse(img, recognize=None):
+        raise ImportError("No module named 'some_codec'", name="some_codec")
+
+    monkeypatch.setattr(ocr, "parse_image", broken_parse)
+    with pytest.raises(ImportError):
+        ocr.recognize(Image.new("RGB", (10, 10)))
+
+
+def test_winrt_import_error_is_reported_as_missing_korean_ocr(monkeypatch):
+    def missing_winrt():
+        raise ImportError("DLL load failed while importing _winrt", name="winrt._winrt")
+
+    monkeypatch.setattr(ocr, "_create_engine", missing_winrt)
+    with pytest.raises(OcrUnavailableError) as excinfo:
+        ocr.recognize(Image.new("RGB", (10, 10)))
+    assert "광학 문자 인식" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("path", fixture_params())
+def test_decoy_label_elsewhere_does_not_change_result(path):
+    """실제 화면에 '거래소 최저가' 글자(미끼)가 하나 더 보여도 결과가 바뀌면 안 된다(작은 해상도 포함)."""
+    path = require_fixture(path)
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+    label = _label_of(im)
+    decoy = im.crop((int(label.x0) - 4, int(label.y0) - 4, int(label.x1) + 4, int(label.y1) + 4))
+    for scale in (1.0, 0.5):
+        base = im if scale == 1.0 else im.resize((int(im.width * scale), int(im.height * scale)), Image.LANCZOS)
+        with_decoy = base.copy()
+        with_decoy.paste(decoy, (int(base.width * 0.70), int(base.height * 0.85)))
+        assert ocr.recognize(with_decoy).price == ocr.recognize(base).price, scale

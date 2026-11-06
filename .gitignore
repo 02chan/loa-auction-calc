@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!/LoaAuctionCalc.spec
 *.exe
 history.csv
 config.json

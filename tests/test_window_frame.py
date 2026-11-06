@@ -252,9 +252,9 @@ def test_hotkey_still_works_while_collapsed(qtbot, make_window, monkeypatch):
 
     def fake_grab():
         calls["grab"] += 1
-        return Image.new("RGB", (640, 360), (5, 5, 5))
+        return [Image.new("RGB", (640, 360), (5, 5, 5))]
 
-    monkeypatch.setattr(capture, "grab_primary_monitor", fake_grab)
+    monkeypatch.setattr(capture, "grab_screens", fake_grab)
     win = make_window(Config(capture_enabled=True))
     win.show()
     win.collapse()
@@ -264,3 +264,81 @@ def test_hotkey_still_works_while_collapsed(qtbot, make_window, monkeypatch):
     assert calls["grab"] == 1
     qtbot.waitUntil(lambda: not win.busy, timeout=30000)
     assert not win.collapsed and win.isVisible()  # 결과(여기서는 인식 실패)를 보여 주려고 펼침
+
+
+# ---------------------------------------------------------------- [캡처] 버튼 · 여러 모니터
+
+
+def _capture_window(make_window, monkeypatch, screens):
+    calls = Counter()
+    monkeypatch.setattr(hotkey, "_register_hotkey", lambda *a: (True, 0))
+    monkeypatch.setattr(hotkey, "_unregister_hotkey", lambda *a: True)
+
+    def fake_grab():
+        calls["grab"] += 1
+        return screens()
+
+    monkeypatch.setattr(capture, "grab_screens", fake_grab)
+    win = make_window(Config(capture_enabled=True))
+    win.show()
+    return win, calls
+
+
+def test_capture_button_captures_once_and_recognizes_other_monitor(qtbot, make_window, monkeypatch):
+    """게임이 주 모니터가 아닌 곳에 있어도: 첫 화면(빈 화면)에서 실패하면 다음 모니터 화면을 읽는다."""
+    from conftest import expected_price, fixture_params, require_fixture
+
+    path = require_fixture(fixture_params()[0].values[0])
+    with Image.open(path) as im:
+        game = im.convert("RGB")
+    win, calls = _capture_window(make_window, monkeypatch, lambda: [Image.new("RGB", (1920, 1080), (8, 8, 12)), game])
+    assert win.capture_button.isVisible()
+    qtbot.mouseClick(win.capture_button, Qt.MouseButton.LeftButton)
+    assert calls["grab"] == 1
+    qtbot.waitUntil(lambda: not win.busy, timeout=30000)
+    assert win.price_edit.text() == str(expected_price(path))
+    qtbot.wait(200)
+    assert calls["grab"] == 1  # 버튼 1번 = 캡처 1번
+
+
+def test_capture_button_hidden_and_inactive_in_paste_only_mode(make_window, monkeypatch):
+    win, calls = _capture_window(make_window, monkeypatch, lambda: [Image.new("RGB", (64, 64))])
+    win.paste_only_check.setChecked(True)
+    assert win.capture_button.isHidden()
+    win._on_capture_clicked()
+    assert calls["grab"] == 0
+    win.paste_only_check.setChecked(False)
+    assert win.capture_button.isVisible()
+
+
+def test_grab_screens_puts_primary_monitor_first(monkeypatch):
+    import mss
+
+    grabbed = []
+
+    class FakeShot:
+        def __init__(self, mon):
+            self.size = (mon["width"], mon["height"])
+            self.bgra = bytes(mon["width"] * mon["height"] * 4)
+
+    class FakeScreens:
+        monitors = [
+            {"left": -1920, "top": 0, "width": 3840, "height": 1080},
+            {"left": -1920, "top": 0, "width": 4, "height": 2},  # 왼쪽 보조 모니터
+            {"left": 0, "top": 0, "width": 6, "height": 3, "is_primary": True},
+        ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def grab(self, mon):
+            grabbed.append(mon["width"])
+            return FakeShot(mon)
+
+    monkeypatch.setattr(mss, "MSS", FakeScreens)
+    images = capture.grab_screens()
+    assert [im.size for im in images] == [(6, 3), (4, 2)]  # 주 모니터가 먼저
+    assert sorted(grabbed) == [4, 6]  # 모든 모니터를 한 번씩
